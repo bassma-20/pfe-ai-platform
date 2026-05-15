@@ -2,16 +2,16 @@ import { Routes, Route, Navigate } from 'react-router-dom';
 import Navbar from './components/Navbarbb';
 import Home from './pages/Home';
 import AutoMLLayout from './pages/automl/AutoMLLayout';
+import AutoMLHome from './pages/automl/AutoMLHome';
 import UploadPage from './pages/automl/UploadPage';
-import EdaPage from './pages/automl/EdaPage';
-import TrainPage from './pages/automl/TrainPage';
-import PredictPage from './pages/automl/PredictPage';
+import ManualPage from './pages/automl/ManualPage';
+import AgentRunPage from './pages/automl/AgentRunPage';
 import MigrationHome from './pages/migration/MigrationHome';
 import './index.css';
 
 export default function App() {
   return (
-    
+
       <div className="app-shell">
         <Navbar />
         <Routes>
@@ -19,11 +19,10 @@ export default function App() {
 
           {/* AutoML — layout avec sidebar */}
           <Route path="/automl" element={<AutoMLLayout />}>
-            <Route index element={<Navigate to="/automl/upload" replace />} />
+            <Route index element={<AutoMLHome />} />
             <Route path="upload" element={<UploadPage />} />
-            <Route path="eda/:runId" element={<EdaPage />} />
-            <Route path="train/:runId" element={<TrainPage />} />
-            <Route path="predict/:runId" element={<PredictPage />} />
+            <Route path="agent/:runId" element={<AgentRunPage />} />
+            <Route path="manual/:runId" element={<ManualPage />} />
           </Route>
 
           {/* Migration */}
@@ -33,6 +32,6 @@ export default function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </div>
-    
+
   );
 }

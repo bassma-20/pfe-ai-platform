@@ -1,17 +1,19 @@
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { Upload, BarChart2, Brain, Zap, CheckCircle } from 'lucide-react';
+import { Upload, Settings, Bot, CheckCircle } from 'lucide-react';
 
-const STEPS = [
-  { id: 1, label: 'Upload',   path: '/automl/upload',      icon: Upload,    param: false },
-  { id: 2, label: 'EDA',      path: '/automl/eda',         icon: BarChart2, param: true  },
-  { id: 3, label: 'Train',    path: '/automl/train',       icon: Brain,     param: true  },
-  { id: 4, label: 'Predict',  path: '/automl/predict',     icon: Zap,       param: true  },
+const MANUAL_STEPS = [
+  { id: 1, label: 'Upload', path: '/automl/upload',  icon: Upload,   param: false },
+  { id: 2, label: 'Manuel', path: '/automl/manual',  icon: Settings, param: true  },
+];
+
+const AGENT_STEPS = [
+  { id: 1, label: 'Upload', path: '/automl/upload', icon: Upload, param: false },
+  { id: 2, label: 'Agent',  path: '/automl/agent',  icon: Bot,    param: true  },
 ];
 
 function getActiveStep(pathname) {
-  if (pathname.startsWith('/automl/predict')) return 4;
-  if (pathname.startsWith('/automl/train'))   return 3;
-  if (pathname.startsWith('/automl/eda'))     return 2;
+  if (pathname.startsWith('/automl/agent'))  return 2;
+  if (pathname.startsWith('/automl/manual')) return 2;
   return 1;
 }
 
@@ -20,15 +22,17 @@ export default function Sidebar() {
   const navigate = useNavigate();
   const params   = useParams();
 
-  // Try to extract runId from URL  e.g. /automl/eda/abc123
+  const isAgent = location.pathname.startsWith('/automl/agent');
+  const STEPS   = isAgent ? AGENT_STEPS : MANUAL_STEPS;
+
   const runId = params.runId || location.pathname.split('/').pop();
   const active = getActiveStep(location.pathname);
 
   function handleStep(step) {
-    if (step.id > active) return; // can't go forward without data
+    if (step.id > active) return;
     if (!step.param) {
       navigate(step.path);
-    } else if (runId && runId.length === 12) {
+    } else if (runId && runId.length >= 6) {
       navigate(`${step.path}/${runId}`);
     }
   }
@@ -68,7 +72,7 @@ export default function Sidebar() {
       })}
 
       {/* Run ID display */}
-      {runId && runId.length === 12 && (
+      {runId && runId.length >= 6 && (
         <div style={{
           marginTop: 'auto',
           padding: '12px',

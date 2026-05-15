@@ -35,7 +35,7 @@ export default function Navbar() {
 
         <div
           className={`navbar-link ${isAutoML ? 'active' : ''}`}
-          onClick={() => navigate('/automl/upload')}
+          onClick={() => navigate('/automl')}
         >
           <Cpu size={14} />
           AutoML

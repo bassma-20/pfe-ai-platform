@@ -243,10 +243,7 @@ def analyze_java_code(code: str) -> dict:
 def _detect_issues(code: str, lines: list[str]) -> list[Issue]:
     issues = []
     for rule in RULES:
-        # Cherche la première occurrence dans le code complet
-        match = re.search(rule["pattern"], code)
-        if match:
-            # Trouver le numéro de ligne
+        for match in re.finditer(rule["pattern"], code):
             line_num = code[:match.start()].count("\n") + 1
             issues.append(Issue(
                 code        = rule["code"],

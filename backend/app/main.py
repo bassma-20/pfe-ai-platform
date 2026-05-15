@@ -25,17 +25,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(
-    automl_router,
-    prefix="/api/automl",
-    tags=["AutoML"],
-)
-
-app.include_router(
-    migration_router,
-    prefix="/api/migration",
-    tags=["Migration Java"],
-)
+# ⚠️ Ne pas ajouter prefix ici — le router définit déjà prefix="/automl"
+app.include_router(automl_router, prefix="/api")
+app.include_router(migration_router, prefix="/api/migration", tags=["Migration Java"])
 
 
 @app.get("/")
@@ -48,18 +40,23 @@ def root():
                 "prefix": "/api/automl",
                 "docs": "/docs#/AutoML",
                 "endpoints": [
-                    "POST /api/automl/upload",
-                    "GET /api/automl/eda/{run_id}",
-                    "POST /api/automl/analyze-features",
-                    "POST /api/automl/train",
-                    "POST /api/automl/predict",
-                    "POST /api/automl/llm/suggest-target",
-                    "POST /api/automl/llm/suggest-features",
-                    "GET /api/automl/llm/explain/{run_id}",
-                    "POST /api/automl/llm/report",
-                    "GET /api/automl/report/{run_id}",
-                    "GET /api/automl/status/{run_id}",
-                    "GET /api/automl/runs",
+                    # ── Upload & Summary ──
+                    "POST   /api/automl/upload",
+                    "GET    /api/automl/summary/{run_id}",
+                    "GET    /api/automl/health",
+
+                    # ── LLM Decision Bus ──
+                    "GET    /api/automl/llm/suggest-target/{run_id}",
+                    "POST   /api/automl/llm/decision-plan/{run_id}",
+                    "POST   /api/automl/llm/apply-plan/{run_id}",
+                    "POST   /api/automl/llm/train-with-plan/{run_id}",
+
+                    # ── Pipeline complet ──
+                    "POST   /api/automl/run-full-pipeline/{run_id}",
+
+                    # ── Résultats ──
+                    "GET    /api/automl/report/{run_id}",
+                    "POST   /api/automl/predict/{run_id}",
                 ],
             },
             "migration": {
@@ -68,3 +65,8 @@ def root():
             },
         },
     }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": "2.0.0"}

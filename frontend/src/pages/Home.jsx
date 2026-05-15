@@ -204,7 +204,7 @@ export default function Home() {
           accentColor="var(--accent)"
           glowColor="rgba(61,127,255,0.15)"
           btnLabel="Lancer AutoML"
-          onClick={() => navigate('/automl/upload')}
+          onClick={() => navigate('/automl')}
         />
         <ModuleCard
           delay={0.18}

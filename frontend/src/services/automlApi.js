@@ -33,3 +33,11 @@ export const predictValue = async (payload) => {
   const res = await api.post("/predict", payload);
   return res.data;
 };
+
+export const agentRun = async (runId, { targetColumn, problemType, maxSteps = 10 } = {}) => {
+  const params = { max_steps: maxSteps };
+  if (targetColumn) params.target_column = targetColumn;
+  if (problemType)  params.problem_type  = problemType;
+  const res = await api.post(`/agent-run/${runId}`, null, { params });
+  return res.data;
+};

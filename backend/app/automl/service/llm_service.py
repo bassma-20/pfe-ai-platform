@@ -1,208 +1,591 @@
+"""
+backend/app/automl/service/llm_service.py
+
+Service LLM-Driven AutoML.
+Le LLM DÉCIDE uniquement via JSON structuré — il ne code jamais.
+Le backend EXÉCUTE les décisions après validation Pydantic stricte.
+"""
+
+from __future__ import annotations
+
 import json
-from openai import OpenAI
-from app.automl.core.config import settings
-from app.automl.core.logging import get_logger
+import logging
+import re
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-log = get_logger("llm_service")
+from pydantic import ValidationError
 
-_client: OpenAI | None = None
+from app.automl.models.schemas import (
+    DatasetSummary,
+    LLMDecisionPlan,
+    ExecutiveSummary,
+    ActionableRecommendation,
+    FinalUserReport,
+    TrainingResult,
+    ExecutionReport,
+    TechnicalInsights,
+    ProblemType,
+)
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+# PROMPT TEMPLATES
+# ─────────────────────────────────────────────
+
+DECISION_PLAN_SYSTEM_PROMPT = """
+You are an expert AutoML decision engine. Your ONLY job is to analyze a dataset summary
+and return a structured JSON decision plan.
+
+CRITICAL RULES:
+1. Return ONLY valid JSON — no markdown, no code blocks, no explanation outside JSON.
+2. Use ONLY the allowed action types listed below.
+3. Every decision must have a "reason" field explaining WHY.
+4. Never invent column names — only use columns from the dataset summary.
+5. Be conservative: prefer simple, safe transformations.
+
+ALLOWED CLEANING ACTIONS:
+- impute_mean, impute_median, impute_mode, impute_knn
+- drop_column, drop_rows_nulls
+- remove_outliers_iqr, remove_outliers_zscore, clip_outliers
+- fill_constant
+
+ALLOWED FEATURE ACTIONS:
+- drop_column
+- create_ratio, create_sum, create_difference, create_product
+- log_transform, sqrt_transform
+- standardize_numeric
+- encode_onehot, encode_ordinal, encode_target
+- extract_datetime
+- binarize
+
+ALLOWED MODELS:
+- RandomForest, GradientBoosting, XGBoost, LightGBM, ExtraTrees
+- LogisticRegression, LinearRegression, Ridge, Lasso, SVM, KNN, DecisionTree
+
+OUTPUT FORMAT (strict):
+{
+  "run_id": "<run_id>",
+  "problem_type": "binary_classification|multiclass_classification|regression",
+  "target_column": "<col>",
+  "confidence": 0.85,
+  "cleaning_actions": [...],
+  "feature_actions": [...],
+  "model_plan": {
+    "models_to_try": [...],
+    "use_optuna": true,
+    "trials": 30,
+    "cv_folds": 5,
+    "primary_metric": "f1|accuracy|roc_auc|r2|rmse",
+    "reason": "..."
+  },
+  "data_warnings": [...],
+  "reasoning_summary": "..."
+}
+"""
+
+DECISION_PLAN_USER_TEMPLATE = """
+Analyze this dataset and return the JSON decision plan.
+
+DATASET SUMMARY:
+- run_id: {run_id}
+- Shape: {n_rows} rows × {n_cols} columns
+- Target column: {target_column}
+- Problem type: {problem_type}
+- Total null %: {total_null_pct:.1f}%
+- Duplicate rows: {duplicate_rows}
+- Class balance: {class_balance}
+
+COLUMNS DETAIL:
+{columns_detail}
+
+USER HINTS:
+{user_hints}
+
+Return ONLY the JSON decision plan. No markdown, no explanation.
+"""
+
+EXPLANATION_SYSTEM_PROMPT = """
+You are an AI assistant explaining AutoML results to a non-technical user.
+Be clear, concise, and avoid jargon. Speak in the user's language (detect from context).
+Focus on business value, not technical details.
+"""
+
+REPORT_SYSTEM_PROMPT = """
+You are an AutoML report generator. Generate a clear, professional explanation
+of the AutoML pipeline results. Structure your response as JSON with these fields:
+{
+  "executive_summary": {
+    "one_liner": "...",
+    "model_performance": "...",
+    "top_factors": ["...", "...", "..."],
+    "recommendation": "..."
+  },
+  "recommendations": [
+    {
+      "priority": "high|medium|low",
+      "category": "data|features|model|deployment",
+      "message": "...",
+      "estimated_impact": "...",
+      "effort": "low|medium|high"
+    }
+  ],
+  "llm_explanation": "..."
+}
+"""
 
 
-def get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        if not settings.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY is not set in .env")
-        _client = OpenAI(api_key=settings.openai_api_key)
-    return _client
+# ─────────────────────────────────────────────
+# LLM CLIENT FACTORY
+# ─────────────────────────────────────────────
+
+def _get_llm_client():
+    import os
+    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+
+    if provider == "anthropic":
+        try:
+            import anthropic
+            return "anthropic", anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        except ImportError:
+            raise RuntimeError("pip install anthropic")
+
+    elif provider == "openai":
+        try:
+            from openai import OpenAI  # ✅ Nouvelle syntaxe
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            return "openai", client
+        except ImportError:
+            raise RuntimeError("pip install openai")
+
+    else:
+        raise ValueError(f"LLM_PROVIDER non supporté: {provider}")
 
 
-def _call(prompt: str, max_tokens: int = 1000, as_json: bool = False) -> str:
-    client = get_client()
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an expert data scientist and ML engineer. "
-                "Be concise, specific, and actionable. "
-                + ("Respond ONLY with valid JSON. No markdown, no preamble." if as_json else "")
-            ),
-        },
-        {"role": "user", "content": prompt},
-    ]
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=0.3,
+def _call_llm(system_prompt: str, user_message: str, max_tokens: int = 4000) -> str:
+    import os
+    provider, client = _get_llm_client()
+    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+    if provider == "anthropic":
+        response = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        return response.content[0].text
+
+    elif provider == "openai":
+        # ✅ Nouvelle syntaxe openai >= 1.0.0
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content
+
+    raise ValueError(f"Provider inconnu: {provider}")
+
+
+# ─────────────────────────────────────────────
+# JSON EXTRACTION
+# ─────────────────────────────────────────────
+
+def _extract_json_from_response(text: str) -> Dict[str, Any]:
+    """
+    Extrait le JSON depuis la réponse LLM.
+    Gère les cas où le LLM ajoute du markdown ou du texte autour.
+    """
+    # Tentative 1 : JSON pur
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        pass
+
+    # Tentative 2 : extraire depuis ```json ... ```
+    pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
+    match = re.search(pattern, text, re.IGNORECASE)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Tentative 3 : trouver le premier { ... } de niveau 0
+    depth = 0
+    start = None
+    for i, char in enumerate(text):
+        if char == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    return json.loads(text[start:i+1])
+                except json.JSONDecodeError:
+                    break
+
+    raise ValueError(f"Impossible d'extraire un JSON valide de la réponse LLM:\n{text[:500]}")
+
+
+# ─────────────────────────────────────────────
+# DATASET SUMMARY BUILDER
+# ─────────────────────────────────────────────
+
+def build_dataset_summary(
+    df,  # pandas DataFrame
+    run_id: str,
+    target_column: Optional[str] = None,
+    problem_type: Optional[str] = None,
+) -> DatasetSummary:
+    """
+    Construit le DatasetSummary depuis un DataFrame pandas.
+    Analyse les colonnes, détecte les types de missing, etc.
+    """
+    import numpy as np
+    import pandas as pd
+    from app.automl.models.schemas import ColumnInfo
+
+    columns_info = []
+    for col in df.columns:
+        series = df[col]
+        null_count = int(series.isnull().sum())
+        null_pct = round(null_count / len(df) * 100, 2)
+        is_numeric = pd.api.types.is_numeric_dtype(series)
+
+        # Skewness pour colonnes numériques
+        skewness = None
+        if is_numeric and null_count < len(df):
+            try:
+                skewness = round(float(series.dropna().skew()), 3)
+            except Exception:
+                pass
+
+        # Détection outliers IQR basique
+        has_outliers_iqr = None
+        if is_numeric and null_count < len(df):
+            try:
+                Q1 = series.quantile(0.25)
+                Q3 = series.quantile(0.75)
+                IQR = Q3 - Q1
+                lower = Q1 - 1.5 * IQR
+                upper = Q3 + 1.5 * IQR
+                n_out = int(((series < lower) | (series > upper)).sum())
+                has_outliers_iqr = n_out > 0
+            except Exception:
+                pass
+
+        # Détection type de missing (heuristique simple)
+        missing_type = "none"
+        if null_pct > 0:
+            # Heuristique : si corrélation du masque de null avec d'autres colonnes
+            if null_pct > 80:
+                missing_type = "MNAR"
+            elif null_pct > 5:
+                missing_type = "MAR"
+            else:
+                missing_type = "MCAR"
+
+        sample_vals = series.dropna().head(5).tolist()
+        # Convertir numpy types en Python natifs
+        sample_vals = [
+            v.item() if hasattr(v, "item") else v
+            for v in sample_vals
+        ]
+
+        columns_info.append(ColumnInfo(
+            name=col,
+            dtype=str(series.dtype),
+            null_count=null_count,
+            null_pct=null_pct,
+            unique_count=int(series.nunique()),
+            sample_values=sample_vals,
+            is_numeric=is_numeric,
+            skewness=skewness,
+            has_outliers_iqr=has_outliers_iqr,
+            missing_type=missing_type,
+        ))
+
+    # Class balance pour classification
+    class_balance = None
+    if target_column and target_column in df.columns:
+        if problem_type in ("binary_classification", "multiclass_classification"):
+            vc = df[target_column].value_counts(normalize=True)
+            class_balance = {str(k): round(float(v), 3) for k, v in vc.items()}
+
+    return DatasetSummary(
+        run_id=run_id,
+        n_rows=len(df),
+        n_cols=len(df.columns),
+        target_column=target_column,
+        problem_type=ProblemType(problem_type) if problem_type else None,
+        columns=columns_info,
+        duplicate_rows=int(df.duplicated().sum()),
+        total_null_pct=round(df.isnull().mean().mean() * 100, 2),
+        class_balance=class_balance,
     )
-    result = response.choices[0].message.content.strip()
-    # ✅ CORRIGÉ : f-string au lieu de kwargs
-    log.info(f"[llm_called] tokens_used={response.usage.total_tokens}")
-    return result
 
 
-def _parse_json(raw: str) -> dict:
-    """Strip markdown fences if present, then parse JSON."""
-    clean = raw.strip()
-    if clean.startswith("```"):
-        clean = clean.split("```")[1]
-        if clean.startswith("json"):
-            clean = clean[4:]
-    return json.loads(clean.strip())
+# ─────────────────────────────────────────────
+# COLONNES DETAIL STRING (pour le prompt)
+# ─────────────────────────────────────────────
+
+def _format_columns_detail(summary: DatasetSummary) -> str:
+    lines = []
+    for col in summary.columns:
+        line = (
+            f"  - {col.name} | dtype={col.dtype} | "
+            f"null={col.null_pct:.1f}% ({col.missing_type}) | "
+            f"unique={col.unique_count}"
+        )
+        if col.skewness is not None:
+            line += f" | skew={col.skewness:.2f}"
+        if col.has_outliers_iqr:
+            line += " | HAS_OUTLIERS"
+        line += f" | samples={col.sample_values[:3]}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
-# ─── 1. Suggest target ────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# CORE: GENERATE DECISION PLAN
+# ─────────────────────────────────────────────
 
-def suggest_target(eda_data: dict) -> dict:
-    """Called after /eda. Returns suggested target column + task type."""
-    prompt = f"""Given this dataset EDA, suggest the best target column for a Machine Learning task.
+def generate_decision_plan(
+    summary: DatasetSummary,
+    user_hints: Optional[Dict[str, Any]] = None,
+) -> LLMDecisionPlan:
+    """
+    Demande au LLM de générer un plan de décision structuré.
+    Valide le JSON retourné avec Pydantic avant de le retourner.
 
-Dataset shape: {eda_data.get('shape')}
-Column types: {json.dumps(eda_data.get('dtypes', {}))}
-Unique values per column: {json.dumps(eda_data.get('unique_values', {}))}
-Missing % per column: {json.dumps(eda_data.get('missing_pct_by_column', {}))}
-Sample rows (first 3): {json.dumps(eda_data.get('sample_rows', [])[:3])}
-Constant columns (exclude these): {eda_data.get('constant_columns', [])}
+    Raises:
+        ValidationError: si le LLM retourne un JSON invalide
+        ValueError: si l'extraction JSON échoue
+        RuntimeError: si l'appel LLM échoue
+    """
+    logger.info(f"[LLM] Génération du plan de décision pour run_id={summary.run_id}")
 
-Respond ONLY with this JSON:
-{{
-  "suggested_target": "column_name",
-  "task_type": "classification or regression",
-  "confidence": "high or medium or low",
-  "reasoning": "one sentence why this column is the best target",
-  "alternative_targets": ["col1", "col2"]
-}}"""
+    user_message = DECISION_PLAN_USER_TEMPLATE.format(
+        run_id=summary.run_id,
+        n_rows=summary.n_rows,
+        n_cols=summary.n_cols,
+        target_column=summary.target_column or "NOT_SPECIFIED",
+        problem_type=summary.problem_type.value if summary.problem_type else "NOT_SPECIFIED",
+        total_null_pct=summary.total_null_pct,
+        duplicate_rows=summary.duplicate_rows,
+        class_balance=json.dumps(summary.class_balance) if summary.class_balance else "N/A",
+        columns_detail=_format_columns_detail(summary),
+        user_hints=json.dumps(user_hints or {}, indent=2),
+    )
+
+    raw_response = _call_llm(
+        system_prompt=DECISION_PLAN_SYSTEM_PROMPT,
+        user_message=user_message,
+        max_tokens=4000,
+    )
+
+    logger.debug(f"[LLM] Réponse brute (500 chars): {raw_response[:500]}")
+
+    raw_json = _extract_json_from_response(raw_response)
+
+    # Injection du run_id si absent
+    raw_json.setdefault("run_id", summary.run_id)
+
+    # Ajout metadata
+    import os
+    raw_json["llm_model_used"] = os.getenv("LLM_MODEL", "unknown")
+    raw_json["generated_at"] = datetime.now(timezone.utc).isoformat()
 
     try:
-        raw = _call(prompt, max_tokens=300, as_json=True)
-        return _parse_json(raw)
-    except Exception as e:
-        # ✅ CORRIGÉ : f-string au lieu de kwargs
-        log.warning(f"[suggest_target_failed] error={e}")
-        return {"error": str(e), "suggested_target": None}
+        plan = LLMDecisionPlan.model_validate(raw_json)
+    except ValidationError as e:
+        logger.error(f"[LLM] Plan JSON invalide: {e}")
+        logger.error(f"[LLM] JSON reçu: {json.dumps(raw_json, indent=2)[:1000]}")
+        raise
+
+    logger.info(
+        f"[LLM] Plan généré: "
+        f"{len(plan.cleaning_actions)} cleaning, "
+        f"{len(plan.feature_actions)} feature, "
+        f"{len(plan.model_plan.models_to_try)} modèles, "
+        f"confiance={plan.confidence:.0%}"
+    )
+    return plan
 
 
-# ─── 2. Suggest features ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# SUGGEST TARGET COLUMN (usage simple)
+# ─────────────────────────────────────────────
 
-def suggest_features(target: str, all_columns: list[str], feature_analysis: dict, dtypes: dict) -> dict:
-    """Called after /analyze-features. Returns recommended feature subset."""
-    prompt = f"""You are reviewing a dataset for ML training.
+def suggest_target_and_type(summary: DatasetSummary) -> Dict[str, str]:
+    """
+    Demande au LLM de suggérer la colonne target et le type de problème.
+    Retourne {"target": "...", "problem_type": "..."}.
+    """
+    system = (
+        "You are an ML expert. Given a dataset summary, suggest the target column "
+        "and problem type. Return ONLY JSON: "
+        '{"target": "col_name", "problem_type": "binary_classification|multiclass_classification|regression", '
+        '"reason": "..."}'
+    )
+    user = (
+        f"Dataset: {summary.n_rows} rows, columns: "
+        f"{[c.name for c in summary.columns]}\n"
+        f"Dtypes: {[f'{c.name}:{c.dtype}' for c in summary.columns]}\n"
+        f"Unique counts: {[f'{c.name}:{c.unique_count}' for c in summary.columns]}\n"
+        "Suggest target and problem type. Return ONLY JSON."
+    )
 
-Target column: '{target}'
-All columns: {all_columns}
-Column types: {json.dumps(dtypes)}
-Recommended features (correlation >= 0.3): {feature_analysis.get('recommended_features', [])}
-Weak features (correlation < 0.1): {feature_analysis.get('weak_features', [])}
-Possible data leakage features: {feature_analysis.get('possible_leakage_features', [])}
-Warnings: {feature_analysis.get('warnings', [])}
-
-Select the optimal feature subset. Exclude: the target itself, ID-like columns, data leakage columns, constant columns.
-
-Respond ONLY with this JSON:
-{{
-  "selected_features": ["col1", "col2"],
-  "excluded_features": ["col3"],
-  "exclusion_reasons": {{"col3": "reason in plain English"}},
-  "engineering_suggestions": ["create ratio col1/col2", "log-transform col3"],
-  "advice": "one actionable sentence for the user"
-}}"""
-
-    try:
-        raw = _call(prompt, max_tokens=500, as_json=True)
-        return _parse_json(raw)
-    except Exception as e:
-        # ✅ CORRIGÉ : f-string au lieu de kwargs
-        log.warning(f"[suggest_features_failed] error={e}")
-        return {"error": str(e), "selected_features": []}
+    raw = _call_llm(system, user, max_tokens=300)
+    return _extract_json_from_response(raw)
 
 
-# ─── 3. Explain results ───────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# GENERATE FINAL REPORT (LLM explanation)
+# ─────────────────────────────────────────────
 
-def explain_results(train_meta: dict) -> str:
-    """Called after /train. Returns plain-language explanation of results."""
-    top3 = train_meta.get("leaderboard", [])[:3]
-    top5_fi = train_meta.get("feature_importance", {}).get("items", [])[:5]
+def generate_report_explanation(
+    summary: DatasetSummary,
+    plan: LLMDecisionPlan,
+    execution_report: ExecutionReport,
+    training_result: TrainingResult,
+) -> Dict[str, Any]:
+    """
+    Demande au LLM de générer l'explication narrative du rapport final.
+    Retourne executive_summary + recommendations + llm_explanation.
+    """
+    logger.info(f"[LLM] Génération de l'explication du rapport pour run_id={summary.run_id}")
 
-    prompt = f"""Explain these AutoML results to a non-technical business stakeholder.
+    context = f"""
+PIPELINE RESULTS:
+- Dataset: {summary.n_rows} rows, {summary.n_cols} columns
+- Target: {plan.target_column} ({plan.problem_type.value})
+- Cleaning: {execution_report.successful}/{execution_report.total_actions} actions réussies
+- Best model: {training_result.best_model}
+- Best metrics: {json.dumps(training_result.best_metrics, indent=2)}
+- Feature importance (top 5): {
+    json.dumps(dict(list(training_result.feature_importance.items())[:5]), indent=2)
+    if training_result.feature_importance else "N/A"
+}
+- Data warnings: {plan.data_warnings}
+- Cleaning actions applied: {[a.model_dump() for a in plan.cleaning_actions[:5]]}
+- Columns dropped: {[a.column for a in plan.feature_actions if a.action == "drop_column"]}
 
-Task: {train_meta.get('task')} on target '{train_meta.get('target')}'
-Best model: {train_meta.get('best_model', {}).get('name')} (quality: {train_meta.get('best_model', {}).get('quality')})
-Top 3 models: {json.dumps(top3)}
-Top 5 most important features: {json.dumps(top5_fi)}
-Optuna tuning used: {train_meta.get('optuna_used')}
-SHAP available: {train_meta.get('shap_summary', {}) is not None}
+Generate the report JSON with: executive_summary, recommendations, llm_explanation.
+Make it clear, professional, and understandable for a non-technical user.
+Detect the language from context and respond in the same language.
+"""
 
-Write a 3-paragraph response:
-1. What the best model achieved and what this means in practical terms
-2. Which features drive the predictions and why that makes intuitive sense
-3. Three specific, concrete actions to improve the model further
-
-Use plain language. No jargon. Be specific, not generic."""
-
-    return _call(prompt, max_tokens=700)
-
-
-# ─── 4. Analyze errors ────────────────────────────────────────────────────────
-
-def analyze_errors(task: str, error_stats: dict, features: list[str]) -> str:
-    """Analyzes model error patterns and suggests fixes."""
-    prompt = f"""Analyze these ML model error patterns and suggest concrete fixes.
-
-Task type: {task}
-Features used: {features}
-Error statistics: {json.dumps(error_stats)}
-
-Give exactly 3 concrete, actionable suggestions to reduce prediction errors.
-For each suggestion, explain WHY it will help for this specific case.
-Be specific, not generic."""
-
-    return _call(prompt, max_tokens=500)
+    raw = _call_llm(REPORT_SYSTEM_PROMPT, context, max_tokens=2000)
+    return _extract_json_from_response(raw)
 
 
-# ─── 5. Generate full report ──────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# EXPLAIN RESULTS (endpoint séparé)
+# ─────────────────────────────────────────────
 
-def generate_report(train_meta: dict, eda_data: dict) -> str:
-    """Generates a complete Markdown analysis report."""
-    top5 = train_meta.get("leaderboard", [])[:5]
-    top5_fi = train_meta.get("feature_importance", {}).get("items", [])[:5]
-    shap = train_meta.get("shap_summary", {})
-    warnings = train_meta.get("feature_analysis", {}).get("warnings", [])
+def explain_results(
+    training_result: TrainingResult,
+    plan: LLMDecisionPlan,
+    language: str = "fr",
+) -> str:
+    """
+    Explication simple des résultats en langage naturel.
+    """
+    system = (
+        f"You are an ML expert explaining results to a business user in {language}. "
+        "Be concise, clear, and focus on actionable insights."
+    )
+    user = f"""
+Model: {training_result.best_model}
+Metrics: {json.dumps(training_result.best_metrics)}
+Problem: {training_result.problem_type.value}
+Target: {training_result.target_column}
+Feature importance: {json.dumps(dict(list((training_result.feature_importance or {}).items())[:5]))}
+Warnings: {plan.data_warnings}
 
-    prompt = f"""Generate a professional AutoML Analysis Report in Markdown format.
+Explain in 3-4 sentences what these results mean for the business.
+"""
+    return _call_llm(system, user, max_tokens=500)
 
-## Input Data
-- Dataset: {eda_data.get('shape', {}).get('rows')} rows × {eda_data.get('shape', {}).get('columns')} columns
-- Missing values: {eda_data.get('missing_total')} total
-- Duplicate rows: {eda_data.get('duplicate_rows')}
-- Outlier columns: {[o['column'] for o in eda_data.get('outliers', [])]}
 
-## ML Configuration  
-- Task: {train_meta.get('task')} on target '{train_meta.get('target')}'
-- Features used: {train_meta.get('features')}
-- Models tested: {len(train_meta.get('leaderboard', []))}
-- Optuna hyperparameter tuning: {train_meta.get('optuna_used')}
-- Best Optuna params: {json.dumps(train_meta.get('best_params'))}
+# ─────────────────────────────────────────────
+# FALLBACK PLAN (si LLM indisponible)
+# ─────────────────────────────────────────────
 
-## Results
-- Best model: {train_meta.get('best_model', {}).get('name')}
-- Quality: {train_meta.get('best_model', {}).get('quality')}
-- Top 5 models: {json.dumps(top5)}
-- Top 5 features by importance: {json.dumps(top5_fi)}
-- SHAP summary: {json.dumps(shap) if shap else 'Not computed'}
-- Warnings: {warnings}
-- Recommendation: {train_meta.get('recommendation')}
+def generate_fallback_plan(summary: DatasetSummary) -> LLMDecisionPlan:
+    """
+    Plan de décision par défaut si le LLM est indisponible.
+    Logique heuristique simple mais robuste.
+    """
+    from app.automl.models.schemas import (
+        CleaningActionType, ModelPlan, ImputeAction,
+        RemoveOutliersAction, ModelName,
+    )
 
-## Required Report Sections (use these exact headers):
-# AutoML Analysis Report
+    cleaning_actions = []
+    feature_actions = []
 
-## 1. Executive Summary
-## 2. Dataset Overview
-## 3. Model Performance Analysis
-## 4. Feature Analysis & Insights
-## 5. Recommendations
-## 6. Next Steps
+    for col in summary.columns:
+        if col.null_pct > 0 and col.name != summary.target_column:
+            if col.is_numeric:
+                action = "impute_median" if (col.skewness and abs(col.skewness) > 1) else "impute_mean"
+                cleaning_actions.append({
+                    "action": action,
+                    "column": col.name,
+                    "reason": f"null_pct={col.null_pct:.1f}%"
+                })
+            else:
+                cleaning_actions.append({
+                    "action": "impute_mode",
+                    "column": col.name,
+                    "reason": f"categorical, null_pct={col.null_pct:.1f}%"
+                })
 
-Write a professional report suitable for a technical team. Be specific. Use the actual numbers provided."""
+        # Outliers sur colonnes numériques avec skew élevé
+        if col.is_numeric and col.has_outliers_iqr and col.name != summary.target_column:
+            cleaning_actions.append({
+                "action": "clip_outliers",
+                "column": col.name,
+                "lower_quantile": 0.01,
+                "upper_quantile": 0.99,
+                "reason": "IQR outliers detected"
+            })
 
-    return _call(prompt, max_tokens=settings.openai_max_tokens)
+    # Modèles par défaut selon le type de problème
+    problem = summary.problem_type
+    if problem == ProblemType.REGRESSION:
+        models = [ModelName.RANDOM_FOREST, ModelName.GRADIENT_BOOSTING, ModelName.RIDGE]
+        metric = "r2"
+    else:
+        models = [ModelName.RANDOM_FOREST, ModelName.GRADIENT_BOOSTING, ModelName.LOGISTIC_REGRESSION]
+        metric = "f1"
+
+    return LLMDecisionPlan(
+        run_id=summary.run_id,
+        problem_type=summary.problem_type or ProblemType.BINARY_CLASSIFICATION,
+        target_column=summary.target_column or "",
+        confidence=0.5,
+        cleaning_actions=cleaning_actions,
+        feature_actions=feature_actions,
+        model_plan=ModelPlan(
+            models_to_try=models,
+            use_optuna=True,
+            trials=20,
+            cv_folds=5,
+            primary_metric=metric,
+            reason="Fallback plan — LLM unavailable",
+        ),
+        data_warnings=["LLM unavailable — using heuristic fallback plan"],
+        reasoning_summary="Plan généré automatiquement par heuristiques (LLM indisponible)",
+        llm_model_used="fallback_heuristic",
+        generated_at=datetime.now(timezone.utc).isoformat(),
+    )
