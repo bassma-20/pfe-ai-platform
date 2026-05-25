@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routers.automl import router as automl_router
 from app.routers.migration import router as migration_router
 from app.automl.core.logging import setup_logging
+from app.chatbot.routes import router as chatbot_router
 
 setup_logging()
 
@@ -28,6 +29,7 @@ app.add_middleware(
 # ⚠️ Ne pas ajouter prefix ici — le router définit déjà prefix="/automl"
 app.include_router(automl_router, prefix="/api")
 app.include_router(migration_router, prefix="/api/migration", tags=["Migration Java"])
+app.include_router(chatbot_router, prefix="/api/chatbot")
 
 
 @app.get("/")

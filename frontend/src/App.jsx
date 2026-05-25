@@ -7,6 +7,8 @@ import UploadPage from './pages/automl/UploadPage';
 import ManualPage from './pages/automl/ManualPage';
 import AgentRunPage from './pages/automl/AgentRunPage';
 import MigrationHome from './pages/migration/MigrationHome';
+import ChatbotPage from './pages/chatbot/ChatbotPage';
+import ChatBubble from './components/ChatBubble';
 import './index.css';
 
 export default function App() {
@@ -28,9 +30,15 @@ export default function App() {
           {/* Migration */}
           <Route path="/migration" element={<MigrationHome />} />
 
+          {/* Chatbot */}
+          <Route path="/chatbot" element={<ChatbotPage />} />
+
           {/* Fallback */}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
+
+        {/* Bulle flottante — visible sur toutes les pages */}
+        <ChatBubble />
       </div>
 
   );

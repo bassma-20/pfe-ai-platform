@@ -1,5 +1,5 @@
 import { useLocation, useNavigate } from 'react-router-dom';
-import { Cpu, GitMerge, Zap } from 'lucide-react';
+import { Cpu, GitMerge, Zap, Bot } from 'lucide-react';
 
 export default function Navbar() {
   const location = useLocation();
@@ -7,6 +7,7 @@ export default function Navbar() {
 
   const isAutoML    = location.pathname.startsWith('/automl');
   const isMigration = location.pathname.startsWith('/migration');
+  const isChatbot   = location.pathname.startsWith('/chatbot');
   const isHome      = location.pathname === '/';
 
   return (
@@ -47,6 +48,14 @@ export default function Navbar() {
         >
           <GitMerge size={14} />
           Migration
+        </div>
+
+        <div
+          className={`navbar-link ${isChatbot ? 'active' : ''}`}
+          onClick={() => navigate('/chatbot')}
+        >
+          <Bot size={14} />
+          Chatbot IA
         </div>
       </div>
 
