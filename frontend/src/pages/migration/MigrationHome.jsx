@@ -1,9 +1,10 @@
 import { useState, useRef, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Upload, Play, Download, GitMerge, CheckCircle, AlertCircle,
   AlertTriangle, ArrowRight, Clock, FileText, Zap, Shield,
   TrendingUp, Code, ChevronDown, ChevronUp, History, Copy, Check,
-  Brain, Users, RefreshCw,
+  Brain, Users, RefreshCw, Bot,
 } from 'lucide-react';
 import {
   uploadFile,
@@ -14,6 +15,7 @@ import {
   getMigrationHistory,
   getDownloadUrl,
 } from '../../services/migrationService';
+import { buildMigrationContext } from '../../services/chatbotService';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -487,6 +489,7 @@ export default function MigrationHome() {
   const [showOriginal,   setShowOriginal]  = useState(false);
   const [showMigrated,   setShowMigrated]  = useState(false);
   const [activeTab,      setActiveTab]     = useState('modifications');
+  const navigate = useNavigate();
 
   useEffect(() => {
     setLoadingHistory(true);
@@ -851,10 +854,31 @@ export default function MigrationHome() {
           {res.summary && (
             <div className="alert alert-success fade-up" style={{ marginBottom: 20 }}>
               <CheckCircle size={16} style={{ flexShrink: 0, marginTop: 1 }} />
-              <div>
+              <div style={{ flex: 1 }}>
                 <div style={{ fontWeight: 600, marginBottom: 4 }}>Résumé de la migration</div>
                 <div style={{ fontSize: 13, lineHeight: 1.6 }}>{res.summary}</div>
               </div>
+              {/* Bouton Expliquer avec l'IA */}
+              <button
+                onClick={() => {
+                  const ctx = buildMigrationContext(res);
+                  sessionStorage.setItem('chatbot_context', ctx);
+                  sessionStorage.setItem('chatbot_question', 'Peux-tu m\'expliquer en détail cette migration de code ? Quelles sont les améliorations les plus importantes et pourquoi ?');
+                  navigate('/chatbot');
+                }}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '6px 14px', borderRadius: 8,
+                  border: '1px solid var(--teal)', background: 'var(--teal-dim)',
+                  color: 'var(--teal)', fontSize: 12, fontWeight: 600,
+                  cursor: 'pointer', flexShrink: 0, whiteSpace: 'nowrap',
+                  transition: 'all 0.2s',
+                }}
+                onMouseOver={e => e.currentTarget.style.background = 'rgba(0,212,170,0.2)'}
+                onMouseOut={e => e.currentTarget.style.background = 'var(--teal-dim)'}
+              >
+                <Bot size={13} /> Expliquer avec l'IA
+              </button>
             </div>
           )}
 

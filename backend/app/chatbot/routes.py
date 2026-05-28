@@ -20,6 +20,7 @@ from typing import Optional
 from app.chatbot.service import (
     chat,
     chat_stream,
+    chat_with_context,
     clear_history,
     get_history,
     SUGGESTIONS,
@@ -38,6 +39,13 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000, description="Message de l'utilisateur")
     session_id: Optional[str] = Field(None, description="ID de session (généré auto si absent)")
     personality: Optional[str] = Field("pedagogue", description="Personnalité : expert | pedagogue | debutant")
+
+
+class ContextChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    context: str = Field(..., description="Contexte AutoML ou Migration à injecter")
+    session_id: Optional[str] = Field(None)
+    personality: Optional[str] = Field("expert")
 
 
 class ChatResponse(BaseModel):
@@ -114,6 +122,27 @@ async def get_session_history(session_id: str):
         "history": history,
         "message_count": len(history),
     }
+
+
+@router.post("/context-stream")
+async def context_stream_endpoint(req: ContextChatRequest):
+    """Stream une réponse avec contexte injecté (AutoML / Migration)."""
+    session_id = req.session_id or str(uuid.uuid4())
+    personality = req.personality if req.personality in PERSONALITIES else "expert"
+
+    return StreamingResponse(
+        chat_with_context(
+            session_id=session_id,
+            message=req.message,
+            context=req.context,
+            personality=personality,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Session-Id": session_id,
+        },
+    )
 
 
 @router.get("/suggestions")

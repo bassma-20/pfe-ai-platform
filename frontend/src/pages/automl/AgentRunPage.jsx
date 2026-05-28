@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams, useNavigate } from 'react-router-dom';
 import {
   Bot, Play, BarChart2, Brain, TrendingUp, CheckCircle,
   ChevronDown, ChevronRight, AlertCircle, Zap, Layers,
@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { agentRun, predictValue } from '../../services/automlApi';
 import AutoMLStepBar from '../../components/AutoMLStepBar';
+import { buildAutoMLContext } from '../../services/chatbotService';
 
 // ─── Méta outils ─────────────────────────────────────────────────────────────
 const TOOL_META = {
@@ -103,6 +104,7 @@ export default function AgentRunPage() {
   const [result,      setResult]      = useState(null);
   const [error,       setError]       = useState(null);
   const [traceOpen,   setTraceOpen]   = useState(false);
+  const navigate = useNavigate();
 
   // Prédiction inline
   const [jsonInput,   setJsonInput]   = useState('{\n  \n}');
@@ -266,6 +268,27 @@ export default function AgentRunPage() {
               </div>
             )}
             <div style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--text-muted)' }}>{trace?.total_steps}/{trace?.max_steps} étapes</div>
+
+            {/* Bouton Expliquer avec l'IA */}
+            <button
+              onClick={() => {
+                const ctx = buildAutoMLContext(result);
+                sessionStorage.setItem('chatbot_context', ctx);
+                sessionStorage.setItem('chatbot_question', 'Peux-tu m\'expliquer ces résultats AutoML ? Pourquoi ce modèle est-il le meilleur ? Que signifient ces métriques ?');
+                navigate('/chatbot');
+              }}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '6px 14px', borderRadius: 8,
+                border: '1px solid var(--teal)', background: 'var(--teal-dim)',
+                color: 'var(--teal)', fontSize: 12, fontWeight: 600,
+                cursor: 'pointer', transition: 'all 0.2s',
+              }}
+              onMouseOver={e => e.currentTarget.style.background = 'rgba(0,212,170,0.2)'}
+              onMouseOut={e => e.currentTarget.style.background = 'var(--teal-dim)'}
+            >
+              <Bot size={13} /> Expliquer avec l'IA
+            </button>
           </div>
 
           {/* Conclusion */}

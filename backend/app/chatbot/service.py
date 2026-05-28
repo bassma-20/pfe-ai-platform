@@ -168,6 +168,53 @@ async def chat(
 # CHAT STREAMING (SSE — Server-Sent Events)
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def chat_with_context(
+    session_id: str,
+    message: str,
+    context: str,
+    personality: str = "pedagogue",
+) -> AsyncGenerator[str, None]:
+    """
+    Stream une réponse en injectant un contexte externe (résultats AutoML, code migré…).
+    Le contexte est injecté une seule fois comme premier message système enrichi.
+    """
+    personality_cfg = PERSONALITIES.get(personality, PERSONALITIES["pedagogue"])
+    system_prompt = personality_cfg["system"] + (
+        "\n\nTu as accès au contexte suivant provenant de la plateforme :\n"
+        "--- CONTEXTE ---\n" + context + "\n--- FIN CONTEXTE ---\n"
+        "Utilise ce contexte pour répondre précisément à la question de l'utilisateur."
+    )
+
+    _sessions[session_id].append({"role": "user", "content": message})
+    _trim_history(session_id)
+
+    messages = [{"role": "system", "content": system_prompt}] + _sessions[session_id]
+    full_reply = ""
+
+    try:
+        client = _get_client()
+        stream = await client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+            messages=messages,
+            temperature=0.7,
+            max_tokens=1500,
+            stream=True,
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                full_reply += delta
+                yield f"data: {json.dumps({'token': delta})}\n\n"
+
+        _sessions[session_id].append({"role": "assistant", "content": full_reply})
+        _trim_history(session_id)
+        yield f"data: {json.dumps({'done': True, 'history_length': len(_sessions[session_id])})}\n\n"
+
+    except Exception as e:
+        logger.error(f"[Chatbot] Erreur context stream: {e}")
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+
 async def chat_stream(
     session_id: str,
     message: str,
