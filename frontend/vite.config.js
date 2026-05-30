@@ -8,6 +8,8 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:8000',
         changeOrigin: true,
+        timeout: 480000,        // 8 minutes (boucle réparation progressive = jusqu'à 6 appels LLM)
+        proxyTimeout: 480000,   // timeout coté proxy aussi
       }
     }
   }

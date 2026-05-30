@@ -2,7 +2,9 @@
 routes.py — Endpoints FastAPI du module de migration (Java + Python)
 """
 
+import asyncio
 import logging
+import re
 import subprocess
 import tempfile
 import traceback
@@ -213,53 +215,78 @@ async def migrate_file_agent(
 # POST /migrate-multi-agent   (Idée 4 — 3 agents coordonnés)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.post("/migrate-multi-agent", summary="Migration multi-agents : Analyste + Migrateur + Vérificateur")
+@router.post("/migrate-multi-agent", summary="Migration multi-agents : Analyste + Migrateur(s) + Vérificateur")
 async def migrate_file_multi_agent(
     filename: str,
     target_version: str = "17",
-    max_rework: int = 2,
+    max_rework: int = 3,
 ):
     """
-    Pipeline multi-agents coordonnés par un orchestrateur :
-    1. AnalyzerAgent  → enrichissement sémantique de l'analyse
-    2. MigratorAgent  → migration avec contexte enrichi + mémoire
-    3. VerifierAgent  → vérification qualité (logique préservée ? régressions ?)
-    L'orchestrateur peut relancer le migrateur si des problèmes sont détectés.
+    Pipeline de réparation progressive multi-agents :
+    1. AnalyzerAgent   → enrichissement sémantique de l'analyse
+    2. MigratorAgent   → migration du code (peut tourner jusqu'à max_rework+1 fois)
+    3. DeterministicFixer → corrections regex garanties après chaque migration
+    4. VerifierAgent   → rapport qualité final (1 seul appel LLM, à la fin)
+
+    Entre les tentatives, l'orchestrateur utilise l'analyseur statique (sans LLM)
+    pour décider si une nouvelle passe est nécessaire.
+    Arrêt dès que 0 problème restant ou stagnation détectée.
     """
-    language = _detect_language(filename)
+    logger.info(f"[migrate-multi-agent] START — filename={filename} target={target_version} max_rework={max_rework}")
+    try:
+        language = _detect_language(filename)
 
-    valid_versions = VALID_PYTHON_VERSIONS if language == "python" else VALID_JAVA_VERSIONS
-    if target_version not in valid_versions:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Version invalide : '{target_version}'. "
-                f"Valeurs acceptées pour {language} : {sorted(valid_versions)}"
+        valid_versions = VALID_PYTHON_VERSIONS if language == "python" else VALID_JAVA_VERSIONS
+        if target_version not in valid_versions:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Version invalide : '{target_version}'. "
+                    f"Valeurs acceptées pour {language} : {sorted(valid_versions)}"
+                )
             )
+
+        file_path = UPLOAD_DIR / (filename + ".upload")
+        if not file_path.exists():
+            file_path = UPLOAD_DIR / filename
+        if not file_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Fichier '{filename}' introuvable. Uploadez-le d'abord via /upload."
+            )
+
+        if max_rework < 0 or max_rework > 5:
+            raise HTTPException(status_code=400, detail="max_rework doit être entre 0 et 5.")
+
+        logger.info(f"[migrate-multi-agent] Lecture fichier : {file_path}")
+        original_code = file_path.read_text(encoding="utf-8")
+        logger.info(f"[migrate-multi-agent] Fichier lu ({len(original_code)} chars) — création orchestrateur")
+
+        orchestrator = MigrationOrchestrator()
+        logger.info("[migrate-multi-agent] Orchestrateur créé — lancement pipeline")
+
+        result = await orchestrator.run(
+            original_code     = original_code,
+            original_filename = filename,
+            language          = language,
+            target_version    = target_version,
+            max_rework        = max_rework,
         )
+        logger.info("[migrate-multi-agent] Pipeline terminé avec succès")
 
-    file_path = UPLOAD_DIR / (filename + ".upload")
-    if not file_path.exists():
-        file_path = UPLOAD_DIR / filename
-    if not file_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Fichier '{filename}' introuvable. Uploadez-le d'abord via /upload."
-        )
-
-    if max_rework < 0 or max_rework > 3:
-        raise HTTPException(status_code=400, detail="max_rework doit être entre 0 et 3.")
-
-    original_code = file_path.read_text(encoding="utf-8")
-
-    orchestrator = MigrationOrchestrator()
-    result = await orchestrator.run(
-        original_code     = original_code,
-        original_filename = filename,
-        language          = language,
-        target_version    = target_version,
-        max_rework        = max_rework,
-    )
+    except HTTPException:
+        raise
+    except asyncio.CancelledError:
+        logger.warning("[migrate-multi-agent] Requête annulée (timeout client ou redémarrage)")
+        return JSONResponse(status_code=503, content={"error": "Requête annulée — pipeline trop long ou timeout. Réessayez ou réduisez max_rework."})
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error(f"[migrate-multi-agent] ERREUR FATALE : {type(e).__name__}: {e}\n{tb}")
+        return JSONResponse(status_code=500, content={
+            "error": f"{type(e).__name__}: {str(e)}",
+            "traceback": tb,
+            "hint": "Vérifiez le terminal backend pour le détail complet"
+        })
 
     lang_label = f"Python {target_version}" if language == "python" else f"Java {target_version}"
 
@@ -355,10 +382,21 @@ async def execute_migrated_code(req: ExecuteRequest):
                 timeout=10,
                 cwd=tmp_dir,
             )
+            stderr = proc.stderr
+            # Détecter les erreurs de dépendances manquantes et donner un conseil
+            if proc.returncode != 0 and "ModuleNotFoundError" in stderr:
+                import re as _re
+                m = _re.search(r"No module named '([^']+)'", stderr)
+                missing = m.group(1) if m else "une bibliothèque externe"
+                stderr += (
+                    f"\n\n💡 CONSEIL : Ce code utilise '{missing}' qui n'est pas installé sur le serveur.\n"
+                    "   → Utilisez le bouton '🤖 IA + Exécuter' qui remplace automatiquement\n"
+                    "     les dépendances externes par des données mockées pour tester la logique."
+                )
             return {
                 "language": "python",
                 "stdout":    proc.stdout,
-                "stderr":    proc.stderr,
+                "stderr":    stderr,
                 "exit_code": proc.returncode,
                 "success":   proc.returncode == 0,
             }
@@ -440,6 +478,154 @@ async def execute_migrated_code(req: ExecuteRequest):
                 "exit_code": -1,
                 "success":  False,
             }
+
+
+class GenerateMainRequest(BaseModel):
+    code: str
+    language: str  # "java" | "python"
+
+
+@router.post("/generate-and-execute", summary="Générer un main() via LLM puis exécuter")
+async def generate_main_and_execute(req: GenerateMainRequest):
+    """
+    1. Utilise le LLM pour ajouter un main() de démonstration au code
+    2. Compile et exécute le résultat
+    """
+    import os
+    from openai import AsyncOpenAI
+
+    if req.language not in ("python", "java"):
+        raise HTTPException(status_code=400, detail="Langage non supporté")
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY manquante.")
+    client = AsyncOpenAI(api_key=api_key)
+
+    # ── Demander au LLM de générer le main() ────────────────────────────────
+    if req.language == "java":
+        prompt = f"""Tu as ce code Java. Modifie-le pour le rendre exécutable avec un simple `javac` sans dépendances externes.
+
+RÈGLES STRICTES (toutes obligatoires) :
+1. UNIQUEMENT des imports java.* et javax.* standard du JDK — JAMAIS org.slf4j, log4j, spring, etc.
+2. Remplace tout logger externe (org.slf4j, log4j) par java.util.logging.Logger du JDK
+3. Remplace la déclaration du logger : `private static final Logger logger = Logger.getLogger(NomClasse.class.getName());`
+4. Si la classe a des dépendances (ex: Employee, User), définis-les comme classes internes statiques simples DANS le même fichier
+5. Ajoute une méthode `public static void main(String[] args)` qui :
+   - Crée des objets fictifs avec des données hardcodées réalistes
+   - Appelle TOUTES les méthodes publiques non-DB
+   - Affiche les résultats avec System.out.println()
+   - Commente ou remplace les appels DB par des données mockées
+6. Supprime le `package com.company.hr;` (nécessite une structure de dossiers)
+7. Le fichier doit compiler avec : javac NomFichier.java (SANS classpath externe)
+
+Retourne UNIQUEMENT le code Java complet modifié, sans markdown, sans explication.
+
+CODE:
+{req.code}"""
+    else:
+        prompt = f"""Tu as ce code Python. Transforme-le pour qu'il soit exécutable avec un simple `python script.py` sans installer aucune bibliothèque externe.
+
+RÈGLES STRICTES (toutes obligatoires) :
+1. SUPPRIME ou REMPLACE tous les imports de bibliothèques tierces non-standard :
+   - `import MySQLdb` → supprimer, utiliser des données mockées à la place
+   - `import pymysql`, `import psycopg2`, `import cx_Oracle` → idem, supprimer
+   - `import redis`, `import pymongo`, `import elasticsearch` → idem, supprimer
+   - `import requests`, `import httpx`, `import aiohttp` → remplacer par données hardcodées
+   - Garde UNIQUEMENT les modules de la bibliothèque standard Python (os, sys, json, logging, datetime, pathlib, typing, re, math, collections, functools, itertools, etc.)
+2. Remplace TOUTES les connexions DB par des données mockées hardcodées (listes, dicts)
+3. Remplace TOUS les appels réseau (API, HTTP) par des données fictives hardcodées
+4. Ajoute un bloc `if __name__ == '__main__':` qui :
+   - Crée des instances fictives avec des données hardcodées réalistes
+   - Appelle TOUTES les fonctions et méthodes publiques
+   - Affiche les résultats avec print()
+5. Le code doit s'exécuter avec UNIQUEMENT la bibliothèque standard Python, sans pip install
+
+Retourne UNIQUEMENT le code Python complet modifié, sans markdown, sans explication.
+
+CODE:
+{req.code}"""
+
+    try:
+        model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Tu es un expert en génération de code de test. Tu retournes UNIQUEMENT du code, jamais de markdown ni d'explication."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=3000,
+        )
+        generated_code = response.choices[0].message.content.strip()
+        # Nettoyer les éventuels blocs markdown
+        generated_code = re.sub(r"^```\w*\s*", "", generated_code)
+        generated_code = re.sub(r"\s*```$", "", generated_code)
+        generated_code = generated_code.strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Erreur LLM : {str(e)}")
+
+    # ── Exécuter le code généré ──────────────────────────────────────────────
+    if req.language == "python":
+        tmp_dir = tempfile.mkdtemp()
+        tmp_path = Path(tmp_dir) / "generated_main.py"
+        tmp_path.write_text(generated_code, encoding="utf-8")
+        for dummy in ("data.json", "log.txt", "orders.log"):
+            (Path(tmp_dir) / dummy).write_text("[]" if dummy.endswith(".json") else "", encoding="utf-8")
+        try:
+            proc = subprocess.run(
+                ["python", str(tmp_path)],
+                capture_output=True, text=True, timeout=15, cwd=tmp_dir,
+            )
+            return {
+                "language": "python",
+                "generated_code": generated_code,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "exit_code": proc.returncode,
+                "success": proc.returncode == 0,
+            }
+        except subprocess.TimeoutExpired:
+            return {"language": "python", "generated_code": generated_code, "stdout": "", "stderr": "Timeout 15s", "exit_code": -1, "success": False}
+        finally:
+            import shutil; shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    else:  # java
+        match = re.search(r'public\s+class\s+(\w+)', generated_code)
+        class_name = match.group(1) if match else "EmployeeService"
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                src = Path(tmpdir) / f"{class_name}.java"
+                src.write_text(generated_code, encoding="utf-8")
+                compile_proc = subprocess.run(
+                    ["javac", str(src)],
+                    capture_output=True, text=True, timeout=20, cwd=tmpdir,
+                )
+                if compile_proc.returncode != 0:
+                    return {
+                        "language": "java",
+                        "generated_code": generated_code,
+                        "stdout": "",
+                        "stderr": f"Erreur compilation :\n{compile_proc.stderr}",
+                        "exit_code": compile_proc.returncode,
+                        "success": False,
+                    }
+                run_proc = subprocess.run(
+                    ["java", class_name],
+                    capture_output=True, text=True, timeout=10, cwd=tmpdir,
+                )
+                return {
+                    "language": "java",
+                    "generated_code": generated_code,
+                    "stdout": run_proc.stdout,
+                    "stderr": run_proc.stderr,
+                    "exit_code": run_proc.returncode,
+                    "success": run_proc.returncode == 0,
+                }
+        except FileNotFoundError:
+            return {"language": "java", "generated_code": generated_code, "stdout": "", "stderr": "javac introuvable. Vérifiez que le JDK est dans le PATH.", "exit_code": -1, "success": False}
+        except subprocess.TimeoutExpired:
+            return {"language": "java", "generated_code": generated_code, "stdout": "", "stderr": "Timeout 20s", "exit_code": -1, "success": False}
 
 
 @router.get("/history", summary="Liste des fichiers migrés")

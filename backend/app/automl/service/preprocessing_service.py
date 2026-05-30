@@ -37,6 +37,14 @@ def build_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
     - Categorical low card  : MostFrequent → OneHotEncoder
     - Categorical high card : MostFrequent → OrdinalEncoder
     """
+    # ── Sécurité : convertir les bool en uint8 (évite SimpleImputer crash) ──────
+    # pd.get_dummies() retourne bool dans pandas >= 1.x ; sklearn ne supporte pas bool
+    bool_cols = X.select_dtypes(include="bool").columns.tolist()
+    if bool_cols:
+        X = X.copy()
+        X[bool_cols] = X[bool_cols].astype(np.uint8)
+        log.info(f"[preprocessor] {len(bool_cols)} colonnes bool converties en uint8: {bool_cols}")
+
     numeric_features = X.select_dtypes(include="number").columns.tolist()
     cat_features = X.select_dtypes(exclude="number").columns.tolist()
 

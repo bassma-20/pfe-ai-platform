@@ -247,6 +247,12 @@ def _train_single_model(
     logger.info(f"  → Entraînement: {model_name.value}")
     start = time.time()
 
+    # ── Sécurité : convertir bool → uint8 (sklearn SimpleImputer ne supporte pas bool) ──
+    for _df in (X_train, X_test):
+        _bool_cols = _df.select_dtypes(include="bool").columns.tolist()
+        if _bool_cols:
+            _df[_bool_cols] = _df[_bool_cols].astype(np.uint8)
+
     is_clf = problem_type in (ProblemType.BINARY_CLASSIFICATION, ProblemType.MULTICLASS_CLASSIFICATION)
     scorer = _get_cv_scorer(model_plan.primary_metric, problem_type)
     cv = (

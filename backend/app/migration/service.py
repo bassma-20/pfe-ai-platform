@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from app.migration.analyzer        import analyze_java_code
 from app.migration.python_analyzer import analyze_python_code
 from app.migration.scorer          import compute_score, compute_improvement
+from app.migration.python_fixer    import apply_deterministic_fixes
 
 load_dotenv()
 
@@ -45,7 +46,14 @@ def read_file(file_path: str, language: str) -> str:
     path = Path(file_path)
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"Fichier introuvable : {file_path}")
-    ext = path.suffix.lower()
+
+    # Le fichier est stocké avec l'extension ".upload" (ex: MyFile.java.upload)
+    # On vérifie l'extension réelle en ignorant le suffixe .upload
+    real_name = path.name
+    if real_name.endswith(".upload"):
+        real_name = real_name[:-len(".upload")]
+    ext = Path(real_name).suffix.lower()
+
     if language == "java" and ext != ".java":
         raise HTTPException(status_code=400, detail="Seuls les fichiers .java sont acceptés.")
     if language == "python" and ext != ".py":
@@ -137,9 +145,9 @@ def build_python_prompt(python_code: str, analysis: dict, target_version: str) -
     features = version_features.get(target_version, "fonctionnalités modernes Python")
     issues_text = _issues_text(analysis)
 
-    return f"""Tu es un expert Python senior. Modernise ce code vers Python {target_version}.
+    return f"""Tu es un expert Python senior. Migre et modernise complètement ce code vers Python {target_version}.
 
-PROBLÈMES DÉTECTÉS (à corriger obligatoirement) :
+PROBLÈMES DÉTECTÉS PAR L'ANALYSEUR STATIQUE (chacun DOIT être corrigé) :
 {issues_text}
 
 FEATURES Python {target_version} à utiliser : {features}
@@ -149,27 +157,64 @@ CODE SOURCE :
 {python_code}
 ```
 
-INSTRUCTIONS STRICTES :
-1. Corrige TOUS les problèmes listés ci-dessus
-2. Utilise les features Python {target_version} listées
-3. Remplace print() par logging, bare except: par des exceptions spécifiques (FileNotFoundError, ValueError, etc.)
-4. Ajoute des type hints si absents
-5. Préserve 100% de la logique métier ET tous les blocs try/except existants — ne jamais supprimer la gestion d'erreurs
-6. OBLIGATOIRE : ajoute toujours `logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')` juste après les imports
-7. OBLIGATOIRE : pour logger une exception utilise TOUJOURS f-string : `logging.error(f"Message: {{e}}")` — JAMAIS `logging.error("msg:", e)` car c'est invalide
-8. Retourne UNIQUEMENT un objet JSON valide, sans texte avant ou après
-9. N'ajoute pas de balises markdown autour du JSON
+INSTRUCTIONS STRICTES — applique CHACUNE sans exception :
+
+── PYTHON 2 → PYTHON 3 (obligatoire) ──────────────────────────────────────
+1. Remplace urllib2 → urllib.request / urllib.error
+2. Remplace cPickle → pickle
+3. Remplace thread → threading
+4. Remplace xrange() → range()
+5. Remplace dict.has_key(k) → k in dict
+6. Remplace .iteritems()/.itervalues()/.iterkeys() → .items()/.values()/.keys()
+7. Remplace apply(func, args) → func(*args)
+8. Remplace execfile(path) → exec(open(path).read())
+9. Remplace basestring → str
+10. Remplace unicode(x) → str(x)
+11. Remplace `print x` → `logging.info(f"{{x}}")`
+12. Remplace `raise ExcType, msg` → `raise ExcType(msg)`
+13. Corrige la division entière implicite : total / count → int résultat selon le contexte
+
+── LOGGING (obligatoire) ────────────────────────────────────────────────────
+14. Remplace TOUS les print() par logging.info() / logging.error() / logging.debug()
+15. Ajoute en tête (après les imports) :
+    import logging
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+    logger = logging.getLogger(__name__)
+16. JAMAIS `logging.error("msg:", e)` — TOUJOURS `logging.error(f"msg: {{e}}")`
+
+── SÉCURITÉ (obligatoire) ───────────────────────────────────────────────────
+17. Corrige TOUTES les injections SQL : remplace le formatage % par des requêtes paramétrées
+    AVANT : cursor.execute("SELECT * FROM t WHERE name='%s'" % name)
+    APRÈS : cursor.execute("SELECT * FROM t WHERE name=%s", (name,))
+
+── GESTION DES EXCEPTIONS (obligatoire) ─────────────────────────────────────
+18. Remplace `except:` (bare) par des exceptions spécifiques (ValueError, IOError, OSError, etc.)
+19. Remplace `except Exception` générique par des exceptions spécifiques quand c'est possible
+20. Ne jamais avaler une exception silencieusement (pas de `except: pass` sans logging)
+
+── GESTION DES RESSOURCES (obligatoire) ─────────────────────────────────────
+21. Remplace tous les `open()` sans `with` par `with open(...) as f:`
+22. Ajoute `with` pour les connexions DB si possible (context manager)
+
+── QUALITÉ PYTHON 3 (obligatoire) ───────────────────────────────────────────
+23. Ajoute des type hints sur toutes les fonctions : def f(x: int) -> str:
+24. Remplace la vérification `type(x) ==` par `isinstance(x, type)`
+25. Utilise les features Python {target_version} listées ci-dessus
+
+── RÈGLE ABSOLUE ─────────────────────────────────────────────────────────────
+26. Préserve 100% de la logique métier — seul le style/syntaxe change
+27. Retourne UNIQUEMENT un objet JSON valide, sans texte avant ou après, sans balises markdown
 
 FORMAT DE RÉPONSE (JSON strict) :
 {{
-  "summary": "Résumé court de la migration en 2-3 phrases",
-  "migrated_code": "# code Python {target_version} complet ici",
+  "summary": "Résumé complet de la migration en 3-5 phrases",
+  "migrated_code": "# code Python {target_version} complet et corrigé ici",
   "modifications": [
     {{
       "title": "Titre court du changement",
       "before": "ancien code",
       "after": "nouveau code",
-      "explanation": "Pourquoi ce changement"
+      "explanation": "Pourquoi ce changement améliore le code"
     }}
   ]
 }}"""
@@ -188,8 +233,9 @@ def build_prompt(code: str, analysis: dict, target_version: str, language: str =
 async def call_llm(prompt: str, language: str) -> str:
     lang_label = "Java" if language == "java" else "Python"
     try:
+        model = os.getenv("OPENAI_MODEL", os.getenv("LLM_MODEL", "gpt-4o-mini"))
         response = await get_client().chat.completions.create(
-            model       = os.getenv("OPENAI_MODEL", "gpt-4o"),
+            model       = model,
             messages    = [
                 {
                     "role":    "system",
@@ -202,7 +248,7 @@ async def call_llm(prompt: str, language: str) -> str:
                 {"role": "user", "content": prompt},
             ],
             temperature = 0.1,
-            max_tokens  = 4096,
+            max_tokens  = 8192,
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -229,7 +275,7 @@ def _ensure_java_package(migrated_code: str, original_code: str) -> str:
     return migrated_code
 
 
-def process_response(raw: str, original_filename: str, language: str, original_code: str = "") -> dict:
+def process_response(raw: str, original_filename: str, language: str, original_code: str = "", save: bool = True) -> dict:
     cleaned = raw.strip()
     cleaned = re.sub(r"^```json\s*", "", cleaned)
     cleaned = re.sub(r"^```\s*",     "", cleaned)
@@ -257,7 +303,7 @@ def process_response(raw: str, original_filename: str, language: str, original_c
         migrated_code = _ensure_java_package(migrated_code, original_code)
 
     saved_file = None
-    if migrated_code:
+    if migrated_code and save:
         ext      = ".py" if language == "python" else ".java"
         stem     = Path(original_filename).stem
         out_path = MIGRATED_DIR / f"{stem}_migrated{ext}"
@@ -305,6 +351,17 @@ async def migrate_code_file(
     prompt           = build_prompt(original_code, analysis_before, target_version, language)
     raw_response     = await call_llm(prompt, language)
     result           = process_response(raw_response, original_filename, language, original_code)
+
+    # Correcteur déterministe : garantit les conversions Python 2→3 que le LLM rate
+    if language == "python" and result.get("migrated_code"):
+        fixed, _ = apply_deterministic_fixes(result["migrated_code"])
+        result["migrated_code"] = fixed
+        # Re-save with fixes applied
+        if result.get("saved_file"):
+            try:
+                Path(result["saved_file"]).write_text(fixed, encoding="utf-8")
+            except Exception:
+                pass
 
     analysis_after = analyze(result["migrated_code"]) if result["migrated_code"] else {}
     score_after    = (
@@ -406,6 +463,10 @@ async def migrate_with_reflection(
 
         if not migrated:
             break
+
+        # Correcteur déterministe post-LLM
+        if language == "python":
+            migrated, _ = apply_deterministic_fixes(migrated)
 
         analysis_iter = analyze(migrated)
         score_iter    = compute_score(analysis_iter)

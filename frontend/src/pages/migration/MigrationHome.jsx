@@ -14,6 +14,8 @@ import {
   downloadMigratedFile,
   getMigrationHistory,
   getDownloadUrl,
+  executeCode,
+  generateAndExecute,
 } from '../../services/migrationService';
 import { buildMigrationContext } from '../../services/chatbotService';
 
@@ -58,7 +60,7 @@ const AGENT_MODES = [
     label: 'Multi-Agents',
     icon: Users,
     color: '#a78bfa',
-    description: 'Analyste + Migrateur + Vérificateur coordonnés',
+    description: 'Boucle réparation jusqu\'à 0 problème',
   },
 ];
 
@@ -72,11 +74,12 @@ const SEVERITY_COLOR = {
 const GRADE_COLOR = { A: '#22c55e', B: '#3d7fff', C: '#f59e0b', D: '#f97316', F: '#ef4444' };
 
 const AGENT_COLOR = {
-  AnalyzerAgent:    { bg: 'rgba(167,139,250,0.1)', border: 'rgba(167,139,250,0.25)', text: '#c4b5fd', dot: '#a78bfa' },
-  MigratorAgent:    { bg: 'rgba(61,127,255,0.1)',  border: 'rgba(61,127,255,0.25)', text: '#93b4ff', dot: '#3d7fff' },
-  VerifierAgent:    { bg: 'rgba(0,212,170,0.1)',   border: 'rgba(0,212,170,0.25)',  text: '#5eead4', dot: '#00d4aa' },
-  Orchestrateur:    { bg: 'rgba(245,158,11,0.1)',  border: 'rgba(245,158,11,0.25)', text: '#fcd34d', dot: '#f59e0b' },
-  default:          { bg: 'rgba(99,102,241,0.1)',  border: 'rgba(99,102,241,0.25)', text: '#a5b4fc', dot: '#6366f1' },
+  AnalyzerAgent:       { bg: 'rgba(167,139,250,0.1)', border: 'rgba(167,139,250,0.25)', text: '#c4b5fd', dot: '#a78bfa' },
+  MigratorAgent:       { bg: 'rgba(61,127,255,0.1)',  border: 'rgba(61,127,255,0.25)', text: '#93b4ff', dot: '#3d7fff' },
+  VerifierAgent:       { bg: 'rgba(0,212,170,0.1)',   border: 'rgba(0,212,170,0.25)',  text: '#5eead4', dot: '#00d4aa' },
+  Orchestrateur:       { bg: 'rgba(245,158,11,0.1)',  border: 'rgba(245,158,11,0.25)', text: '#fcd34d', dot: '#f59e0b' },
+  DeterministicFixer:  { bg: 'rgba(34,197,94,0.08)',  border: 'rgba(34,197,94,0.2)',   text: '#86efac', dot: '#22c55e' },
+  default:             { bg: 'rgba(99,102,241,0.1)',  border: 'rgba(99,102,241,0.25)', text: '#a5b4fc', dot: '#6366f1' },
 };
 
 // ─── Composants réutilisables ─────────────────────────────────────────────────
@@ -478,6 +481,7 @@ export default function MigrationHome() {
   const [dragging,       setDragging]      = useState(false);
   const [targetVersion,  setTargetVersion] = useState('17');
   const [agentMode,      setAgentMode]     = useState('standard');
+  const [maxRework,      setMaxRework]     = useState(3);
   const [uploadResult,   setUploadResult]  = useState(null);
   const [migrateResult,  setMigrateResult] = useState(null);
   const [history,        setHistory]       = useState(null);
@@ -489,6 +493,12 @@ export default function MigrationHome() {
   const [showOriginal,   setShowOriginal]  = useState(false);
   const [showMigrated,   setShowMigrated]  = useState(false);
   const [activeTab,      setActiveTab]     = useState('modifications');
+  const [execResult,     setExecResult]    = useState(null);
+  const [loadingExec,    setLoadingExec]   = useState(false);
+  const [loadingGenExec, setLoadingGenExec] = useState(false);
+  const [genExecResult,  setGenExecResult]  = useState(null);
+  const [editedCode,     setEditedCode]     = useState(null);
+  const [codeEditMode,   setCodeEditMode]   = useState(false);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -542,11 +552,13 @@ export default function MigrationHome() {
       if (agentMode === 'reflection') {
         r = await migrateFileAgent(uploadResult.filename, targetVersion, 3);
       } else if (agentMode === 'multi_agent') {
-        r = await migrateFileMultiAgent(uploadResult.filename, targetVersion, 2);
+        r = await migrateFileMultiAgent(uploadResult.filename, targetVersion, maxRework);
       } else {
         r = await migrateFile(uploadResult.filename, targetVersion);
       }
       setMigrateResult(r);
+      setEditedCode(r.migrated_code);
+      setCodeEditMode(false);
       setStep(4);
       getMigrationHistory().then(setHistory).catch(() => {});
     } catch (e) {
@@ -561,6 +573,38 @@ export default function MigrationHome() {
     setStep(1); setFile(null); setUploadResult(null); setMigrateResult(null);
     setError(null); setShowOriginal(false); setShowMigrated(false); setCodeTab('migrated');
     setLanguage('java'); setTargetVersion('17'); setAgentMode('standard');
+    setExecResult(null); setGenExecResult(null);
+    setEditedCode(null); setCodeEditMode(false);
+  }
+
+  async function handleExecute() {
+    if (!migrateResult?.migrated_code) return;
+    setLoadingExec(true);
+    setExecResult(null);
+    try {
+      const codeToRun = editedCode ?? migrateResult.migrated_code;
+      const r = await executeCode(codeToRun, migrateResult.language || language);
+      setExecResult(r);
+    } catch (e) {
+      setExecResult({ success: false, stderr: e?.response?.data?.detail || e.message, stdout: '', exit_code: -1 });
+    } finally {
+      setLoadingExec(false);
+    }
+  }
+
+  async function handleGenerateAndExecute() {
+    if (!migrateResult?.migrated_code) return;
+    setLoadingGenExec(true);
+    setGenExecResult(null);
+    try {
+      const codeToRun = editedCode ?? migrateResult.migrated_code;
+      const r = await generateAndExecute(codeToRun, migrateResult.language || language);
+      setGenExecResult(r);
+    } catch (e) {
+      setGenExecResult({ success: false, stderr: e?.response?.data?.detail || e.message, stdout: '', exit_code: -1, generated_code: '' });
+    } finally {
+      setLoadingGenExec(false);
+    }
   }
 
   const res      = migrateResult;
@@ -713,6 +757,48 @@ export default function MigrationHome() {
                   })}
                 </div>
               </div>
+
+              {/* Tentatives max — visible seulement en mode Multi-Agents */}
+              {agentMode === 'multi_agent' && (
+                <div className="form-group" style={{ marginBottom: 20 }}>
+                  <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <RefreshCw size={13} color="#a78bfa" />
+                    Tentatives de réparation max
+                    <span style={{ marginLeft: 'auto', fontWeight: 800, fontSize: 14, color: '#a78bfa', fontFamily: 'var(--font-display)' }}>
+                      {maxRework + 1} passe{maxRework + 1 > 1 ? 's' : ''}
+                    </span>
+                  </label>
+                  <input
+                    type="range"
+                    min={1}
+                    max={5}
+                    value={maxRework}
+                    onChange={e => setMaxRework(Number(e.target.value))}
+                    style={{ width: '100%', accentColor: '#a78bfa', cursor: 'pointer' }}
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+                    {[1, 2, 3, 4, 5].map(v => (
+                      <span key={v} style={{
+                        fontSize: 10, color: maxRework === v ? '#a78bfa' : 'var(--text-muted)',
+                        fontWeight: maxRework === v ? 800 : 400, fontFamily: 'var(--font-display)',
+                        cursor: 'pointer',
+                      }} onClick={() => setMaxRework(v)}>
+                        {v + 1}×
+                      </span>
+                    ))}
+                  </div>
+                  <div style={{
+                    marginTop: 8, padding: '8px 12px', borderRadius: 8,
+                    background: 'rgba(167,139,250,0.08)', border: '1px solid rgba(167,139,250,0.2)',
+                    fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5,
+                  }}>
+                    🔄 Pipeline : <strong style={{ color: '#c4b5fd' }}>Analyste</strong> → <strong style={{ color: '#93b4ff' }}>Migrateur</strong> ×{maxRework + 1} max
+                    → <strong style={{ color: '#5eead4' }}>Vérificateur</strong>
+                    <br />
+                    Arrêt dès <strong style={{ color: '#86efac' }}>0 problème</strong> · ~{maxRework + 3} appels LLM max
+                  </div>
+                </div>
+              )}
 
               {/* Version cible */}
               <div className="form-group" style={{ marginBottom: 20 }}>
@@ -979,11 +1065,28 @@ export default function MigrationHome() {
                 })}
               </div>
 
-              {/* Infos + download */}
+              {/* Infos + download + edit toggle */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'monospace' }}>
                   {LANG_ICON[resLang]} {LANG_LABEL[resLang]} {codeTab === 'migrated' ? targetVersion : ''}
                 </span>
+                {codeTab === 'migrated' && (
+                  <button
+                    className="btn btn-sm"
+                    style={{
+                      background: codeEditMode ? 'rgba(0,212,170,0.15)' : 'rgba(61,127,255,0.1)',
+                      color: codeEditMode ? 'var(--teal)' : 'var(--accent)',
+                      border: `1px solid ${codeEditMode ? 'rgba(0,212,170,0.4)' : 'rgba(61,127,255,0.3)'}`,
+                      fontSize: 12,
+                    }}
+                    onClick={() => {
+                      if (!codeEditMode) setEditedCode(editedCode ?? res.migrated_code);
+                      setCodeEditMode(m => !m);
+                    }}
+                  >
+                    <Code size={13} /> {codeEditMode ? '✓ Vue' : '✎ Éditer'}
+                  </button>
+                )}
                 <button
                   className="btn btn-sm"
                   style={{ background: 'rgba(0,212,170,0.1)', color: 'var(--teal)', border: '1px solid rgba(0,212,170,0.3)', fontSize: 12 }}
@@ -1036,7 +1139,38 @@ export default function MigrationHome() {
             {/* Code content */}
             <div style={{ padding: '0' }}>
               {codeTab === 'migrated' && res.migrated_code && (
-                <HighlightedCode code={res.migrated_code} language={resLang} maxHeight={520} />
+                codeEditMode ? (
+                  <div style={{ position: 'relative' }}>
+                    <textarea
+                      value={editedCode ?? res.migrated_code}
+                      onChange={e => setEditedCode(e.target.value)}
+                      spellCheck={false}
+                      style={{
+                        width: '100%', minHeight: 520, maxHeight: 520,
+                        background: 'var(--bg-elevated)',
+                        color: 'var(--text)',
+                        fontFamily: 'monospace', fontSize: 13,
+                        border: 'none', outline: 'none',
+                        padding: '16px', resize: 'vertical',
+                        boxSizing: 'border-box',
+                        lineHeight: 1.6,
+                        overflowY: 'auto',
+                      }}
+                    />
+                    <div style={{
+                      position: 'absolute', bottom: 10, right: 12,
+                      fontSize: 11, color: 'var(--teal)',
+                      background: 'rgba(0,212,170,0.1)',
+                      border: '1px solid rgba(0,212,170,0.25)',
+                      padding: '2px 8px', borderRadius: 4,
+                      pointerEvents: 'none',
+                    }}>
+                      ✎ Mode édition — cliquez "✓ Vue" pour quitter
+                    </div>
+                  </div>
+                ) : (
+                  <HighlightedCode code={editedCode ?? res.migrated_code} language={resLang} maxHeight={520} />
+                )
               )}
               {codeTab === 'original' && res.original_code && (
                 <HighlightedCode code={res.original_code} language={resLang} maxHeight={520} />
@@ -1047,7 +1181,7 @@ export default function MigrationHome() {
 
 
           {/* Actions */}
-          <div style={{ display: 'flex', gap: 12 }}>
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
             <button
               className="btn btn-teal btn-lg"
               style={{ flex: 1 }}
@@ -1055,10 +1189,157 @@ export default function MigrationHome() {
             >
               <Download size={16} /> Télécharger le code migré
             </button>
+            <button
+              className="btn btn-lg"
+              style={{ flex: 1, background: 'rgba(167,139,250,0.15)', color: '#c4b5fd', border: '1px solid rgba(167,139,250,0.35)' }}
+              onClick={handleExecute}
+              disabled={loadingExec || loadingGenExec}
+            >
+              {loadingExec
+                ? <><div className="spinner" style={{ width: 14, height: 14 }} /> Exécution…</>
+                : <><Play size={16} /> Exécuter</>
+              }
+            </button>
+            <button
+              className="btn btn-lg"
+              style={{ flex: 1, background: 'rgba(245,158,11,0.12)', color: '#fcd34d', border: '1px solid rgba(245,158,11,0.3)' }}
+              onClick={handleGenerateAndExecute}
+              disabled={loadingExec || loadingGenExec}
+              title="Le LLM génère un main() de test puis exécute"
+            >
+              {loadingGenExec
+                ? <><div className="spinner" style={{ width: 14, height: 14 }} /> IA génère…</>
+                : <><Bot size={16} /> IA + Exécuter</>
+              }
+            </button>
             <button className="btn btn-secondary btn-lg" onClick={reset}>
               Nouvelle migration
             </button>
           </div>
+
+          {/* Indicateur code modifié */}
+          {editedCode && editedCode !== res.migrated_code && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              padding: '8px 14px', borderRadius: 'var(--radius)',
+              background: 'rgba(245,158,11,0.08)',
+              border: '1px solid rgba(245,158,11,0.25)',
+              fontSize: 12, color: '#fcd34d',
+            }}>
+              <AlertTriangle size={13} />
+              <span>Code modifié manuellement — "Exécuter" utilisera votre version éditée.</span>
+              <button
+                style={{ marginLeft: 'auto', background: 'none', border: 'none', color: '#fcd34d', cursor: 'pointer', fontSize: 12, textDecoration: 'underline' }}
+                onClick={() => { setEditedCode(res.migrated_code); setCodeEditMode(false); }}
+              >
+                Annuler les modifications
+              </button>
+            </div>
+          )}
+
+          {/* Résultat d'exécution */}
+          {execResult && (
+            <div style={{
+              marginTop: 16,
+              borderRadius: 'var(--radius)',
+              border: `1px solid ${execResult.success ? 'rgba(0,212,170,0.3)' : 'rgba(239,68,68,0.3)'}`,
+              background: execResult.success ? 'rgba(0,212,170,0.05)' : 'rgba(239,68,68,0.05)',
+              overflow: 'hidden',
+            }}>
+              <div style={{
+                padding: '10px 16px',
+                display: 'flex', alignItems: 'center', gap: 8,
+                borderBottom: `1px solid ${execResult.success ? 'rgba(0,212,170,0.2)' : 'rgba(239,68,68,0.2)'}`,
+                background: execResult.success ? 'rgba(0,212,170,0.08)' : 'rgba(239,68,68,0.08)',
+              }}>
+                {execResult.success
+                  ? <CheckCircle size={14} color="var(--teal)" />
+                  : <AlertCircle size={14} color="#f87171" />
+                }
+                <span style={{ fontSize: 13, fontWeight: 600, color: execResult.success ? 'var(--teal)' : '#f87171' }}>
+                  {execResult.success ? 'Exécution réussie' : 'Erreur d\'exécution'} — exit code {execResult.exit_code}
+                </span>
+              </div>
+              <div style={{ padding: 16, fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6 }}>
+                {execResult.stdout && (
+                  <div>
+                    <div style={{ color: 'var(--text-muted)', marginBottom: 4, fontSize: 11 }}>STDOUT :</div>
+                    <pre style={{ color: '#a3e635', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{execResult.stdout}</pre>
+                  </div>
+                )}
+                {execResult.stderr && (
+                  <div style={{ marginTop: execResult.stdout ? 12 : 0 }}>
+                    <div style={{ color: 'var(--text-muted)', marginBottom: 4, fontSize: 11 }}>STDERR :</div>
+                    <pre style={{ color: '#fca5a5', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{execResult.stderr}</pre>
+                  </div>
+                )}
+                {!execResult.stdout && !execResult.stderr && (
+                  <span style={{ color: 'var(--text-muted)' }}>Aucune sortie.</span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Résultat IA + Exécuter */}
+          {genExecResult && (
+            <div style={{ marginTop: 16 }}>
+              {/* Code généré par le LLM */}
+              {genExecResult.generated_code && (
+                <details style={{ marginBottom: 12 }}>
+                  <summary style={{ cursor: 'pointer', fontSize: 12, color: '#fcd34d', padding: '8px 0', userSelect: 'none' }}>
+                    🤖 Voir le code avec main() généré par l'IA
+                  </summary>
+                  <pre style={{
+                    marginTop: 8, padding: 12, borderRadius: 'var(--radius)',
+                    background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+                    fontSize: 11, color: 'var(--text-secondary)', overflowX: 'auto',
+                    maxHeight: 300, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                  }}>
+                    {genExecResult.generated_code}
+                  </pre>
+                </details>
+              )}
+              {/* Résultat d'exécution */}
+              <div style={{
+                borderRadius: 'var(--radius)',
+                border: `1px solid ${genExecResult.success ? 'rgba(0,212,170,0.3)' : 'rgba(239,68,68,0.3)'}`,
+                background: genExecResult.success ? 'rgba(0,212,170,0.05)' : 'rgba(239,68,68,0.05)',
+                overflow: 'hidden',
+              }}>
+                <div style={{
+                  padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 8,
+                  borderBottom: `1px solid ${genExecResult.success ? 'rgba(0,212,170,0.2)' : 'rgba(239,68,68,0.2)'}`,
+                  background: genExecResult.success ? 'rgba(0,212,170,0.08)' : 'rgba(239,68,68,0.08)',
+                }}>
+                  <Bot size={14} color="#fcd34d" />
+                  {genExecResult.success
+                    ? <CheckCircle size={14} color="var(--teal)" />
+                    : <AlertCircle size={14} color="#f87171" />
+                  }
+                  <span style={{ fontSize: 13, fontWeight: 600, color: genExecResult.success ? 'var(--teal)' : '#f87171' }}>
+                    IA + Exécution — {genExecResult.success ? 'Succès' : 'Erreur'} (exit {genExecResult.exit_code})
+                  </span>
+                </div>
+                <div style={{ padding: 16, fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6 }}>
+                  {genExecResult.stdout && (
+                    <div>
+                      <div style={{ color: 'var(--text-muted)', marginBottom: 4, fontSize: 11 }}>STDOUT :</div>
+                      <pre style={{ color: '#a3e635', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{genExecResult.stdout}</pre>
+                    </div>
+                  )}
+                  {genExecResult.stderr && (
+                    <div style={{ marginTop: genExecResult.stdout ? 12 : 0 }}>
+                      <div style={{ color: 'var(--text-muted)', marginBottom: 4, fontSize: 11 }}>STDERR :</div>
+                      <pre style={{ color: '#fca5a5', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{genExecResult.stderr}</pre>
+                    </div>
+                  )}
+                  {!genExecResult.stdout && !genExecResult.stderr && (
+                    <span style={{ color: 'var(--text-muted)' }}>Aucune sortie.</span>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 

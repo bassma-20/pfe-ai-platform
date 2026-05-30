@@ -161,6 +161,22 @@ def _clip_outliers(
     return df, n_clipped
 
 
+def _drop_duplicates(
+    df: pd.DataFrame,
+    subset: Optional[List[str]] = None,
+    **kwargs,
+) -> Tuple[pd.DataFrame, int]:
+    """Supprime les lignes dupliquées (sur toutes les colonnes ou un sous-ensemble)."""
+    n_before = len(df)
+    if subset:
+        # Vérifier que toutes les colonnes existent
+        valid_subset = [c for c in subset if c in df.columns]
+        df = df.drop_duplicates(subset=valid_subset if valid_subset else None)
+    else:
+        df = df.drop_duplicates()
+    return df, n_before - len(df)
+
+
 def _fill_constant(df: pd.DataFrame, column: str, value: Any, **kwargs) -> Tuple[pd.DataFrame, int]:
     if column not in df.columns:
         raise KeyError(f"Colonne '{column}' introuvable")
@@ -266,7 +282,7 @@ def _encode_onehot(
             f"'{column}' a {n_unique} catégories > max_categories={max_categories}. "
             "Utiliser encode_target ou encode_ordinal à la place."
         )
-    dummies = pd.get_dummies(df[column], prefix=column, drop_first=False)
+    dummies = pd.get_dummies(df[column], prefix=column, drop_first=False, dtype=np.uint8)
     df = pd.concat([df.drop(columns=[column]), dummies], axis=1)
     return df, n_unique
 
@@ -349,6 +365,7 @@ CLEANING_ACTION_WHITELIST: Dict[str, callable] = {
     "impute_knn":               _impute_knn,
     "drop_column":              _drop_column,
     "drop_rows_nulls":          _drop_rows_nulls,
+    "drop_duplicates":          _drop_duplicates,
     "remove_outliers_iqr":      _remove_outliers_iqr,
     "remove_outliers_zscore":   _remove_outliers_zscore,
     "clip_outliers":            _clip_outliers,
@@ -504,6 +521,13 @@ def execute_plan(
 
         df, result = _execute_single_action(df, action, FEATURE_ACTION_WHITELIST, plan.target_column)
         results.append(result)
+
+    # ── Conversion bool → uint8 (compatibilité sklearn SimpleImputer) ──────────
+    # pd.get_dummies() peut retourner bool ; sklearn refuse bool dans SimpleImputer
+    bool_cols = df.select_dtypes(include="bool").columns.tolist()
+    if bool_cols:
+        df[bool_cols] = df[bool_cols].astype(np.uint8)
+        logger.info(f"[Executor] {len(bool_cols)} colonnes bool → uint8: {bool_cols}")
 
     # ── Récap ──
     n_success = sum(1 for r in results if r.status == "success")

@@ -26,6 +26,7 @@ class CleaningActionType(str, Enum):
     REMOVE_OUTLIERS_ZSCORE = "remove_outliers_zscore"
     CLIP_OUTLIERS          = "clip_outliers"
     FILL_CONSTANT          = "fill_constant"
+    DROP_DUPLICATES        = "drop_duplicates"
 
 class FeatureActionType(str, Enum):
     DROP_COLUMN       = "drop_column"
@@ -110,6 +111,11 @@ class DropRowsNullsAction(BaseModel):
     threshold: Optional[float] = Field(default=None)
     reason: Optional[str] = None
 
+class DropDuplicatesAction(BaseModel):
+    action: Literal[CleaningActionType.DROP_DUPLICATES]
+    subset: Optional[List[str]] = None   # colonnes à considérer (None = toutes)
+    reason: Optional[str] = None
+
 CleaningAction = Union[
     ImputeAction,
     DropColumnAction,
@@ -117,6 +123,7 @@ CleaningAction = Union[
     ClipOutliersAction,
     FillConstantAction,
     DropRowsNullsAction,
+    DropDuplicatesAction,
 ]
 
 

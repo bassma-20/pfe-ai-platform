@@ -54,10 +54,15 @@ export async function migrateFileAgent(filename, targetVersion = '17', maxIterat
   return data;
 }
 
-// ─── 5. Migration multi-agents (Idée 4) ──────────────────────────────────────
-export async function migrateFileMultiAgent(filename, targetVersion = '17', maxRework = 2) {
+// ─── 5. Migration multi-agents — boucle de réparation progressive ────────────
+// Optimisé : Vérificateur LLM ne tourne QU'UNE FOIS à la fin.
+// Entre les tentatives : analyseur statique gratuit (pas de LLM).
+// max_rework=3 → 4 tentatives max (Analyste + 4×Migrateur + Vérificateur = 6 LLM calls max)
+// Arrêt anticipé dès que 0 problème restant ou stagnation.
+export async function migrateFileMultiAgent(filename, targetVersion = '17', maxRework = 3) {
   const { data } = await axios.post(`${BASE}/migrate-multi-agent`, null, {
     params: { filename, target_version: targetVersion, max_rework: maxRework },
+    timeout: 420000,  // 7 minutes — jusqu'à 4 passes de migration
   });
   return data;
 }
@@ -66,6 +71,12 @@ export async function migrateFileMultiAgent(filename, targetVersion = '17', maxR
 export async function executeCode(code, language) {
   const { data } = await axios.post(`${BASE}/execute`, { code, language });
   return data; // { stdout, stderr, exit_code, success }
+}
+
+// ─── 6b. Générer un main() via LLM puis exécuter ─────────────────────────────
+export async function generateAndExecute(code, language) {
+  const { data } = await axios.post(`${BASE}/generate-and-execute`, { code, language });
+  return data; // { generated_code, stdout, stderr, exit_code, success }
 }
 
 // ─── 7. Historique des fichiers migrés ───────────────────────────────────────

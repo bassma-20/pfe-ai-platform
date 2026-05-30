@@ -64,6 +64,11 @@ def _quality(score: float, task: str) -> str:
 
 
 def _build_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
+    # Convertir bool → uint8 pour éviter SimpleImputer crash (pd.get_dummies retourne bool)
+    bool_cols = X.select_dtypes(include="bool").columns.tolist()
+    if bool_cols:
+        X = X.copy()
+        X[bool_cols] = X[bool_cols].astype(np.uint8)
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
 

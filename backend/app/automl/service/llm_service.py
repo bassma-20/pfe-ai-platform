@@ -41,46 +41,63 @@ and return a structured JSON decision plan.
 CRITICAL RULES:
 1. Return ONLY valid JSON — no markdown, no code blocks, no explanation outside JSON.
 2. Use ONLY the allowed action types listed below.
-3. Every decision must have a "reason" field explaining WHY.
+3. Every action MUST have a "reason" field.
 4. Never invent column names — only use columns from the dataset summary.
 5. Be conservative: prefer simple, safe transformations.
 
-ALLOWED CLEANING ACTIONS:
-- impute_mean, impute_median, impute_mode, impute_knn
-- drop_column, drop_rows_nulls
-- remove_outliers_iqr, remove_outliers_zscore, clip_outliers
-- fill_constant
+━━━ CLEANING ACTIONS (go in "cleaning_actions" array) ━━━
+These handle missing values, duplicates, outliers:
+  {"action": "impute_mean",          "column": "col_name",  "reason": "..."}
+  {"action": "impute_median",        "column": "col_name",  "reason": "..."}
+  {"action": "impute_mode",          "column": "col_name",  "reason": "..."}
+  {"action": "drop_rows_nulls",                             "reason": "..."}
+  {"action": "drop_duplicates",                             "reason": "..."}
+  {"action": "clip_outliers",        "column": "col_name",  "reason": "..."}
+  {"action": "remove_outliers_iqr",  "column": "col_name",  "reason": "..."}
+  {"action": "drop_column",          "column": "col_name",  "reason": "..."}
 
-ALLOWED FEATURE ACTIONS:
-- drop_column
-- create_ratio, create_sum, create_difference, create_product
-- log_transform, sqrt_transform
-- standardize_numeric
-- encode_onehot, encode_ordinal, encode_target
-- extract_datetime
-- binarize
+⚠️  IMPORTANT: remove_outliers_iqr, clip_outliers belong ONLY in "cleaning_actions". NEVER put them in "feature_actions".
+⚠️  IMPORTANT: To remove duplicate ROWS use {"action": "drop_duplicates", "reason": "..."}. NEVER use drop_column with a fake column name like "Duplicate rows".
 
-ALLOWED MODELS:
-- RandomForest, GradientBoosting, XGBoost, LightGBM, ExtraTrees
-- LogisticRegression, LinearRegression, Ridge, Lasso, SVM, KNN, DecisionTree
+━━━ FEATURE ACTIONS (go in "feature_actions" array) ━━━
+These create or transform features. Each needs a "column" field:
+  {"action": "encode_onehot",    "column": "col_name",                          "reason": "..."}
+  {"action": "encode_ordinal",   "column": "col_name",                          "reason": "..."}
+  {"action": "encode_target",    "column": "col_name",                          "reason": "..."}
+  {"action": "standardize_numeric", "columns": ["col1", "col2"],                "reason": "..."}
+  {"action": "log_transform",    "column": "col_name",                          "reason": "..."}
+  {"action": "sqrt_transform",   "column": "col_name",                          "reason": "..."}
+  {"action": "binarize",         "column": "col_name",   "threshold": 0.5,      "reason": "..."}
+  {"action": "drop_column",      "column": "col_name",                          "reason": "..."}
+  {"action": "create_ratio",     "new_feature": "name", "col1": "a", "col2": "b", "reason": "..."}
 
-OUTPUT FORMAT (strict):
+⚠️  IMPORTANT: encode_onehot REQUIRES "column" (one column at a time). standardize_numeric REQUIRES "columns" (list).
+
+━━━ ALLOWED MODELS ━━━
+RandomForest, GradientBoosting, XGBoost, LightGBM, ExtraTrees,
+LogisticRegression, LinearRegression, Ridge, Lasso, SVM, KNN, DecisionTree
+
+━━━ OUTPUT FORMAT (strict) ━━━
 {
   "run_id": "<run_id>",
   "problem_type": "binary_classification|multiclass_classification|regression",
   "target_column": "<col>",
   "confidence": 0.85,
-  "cleaning_actions": [...],
-  "feature_actions": [...],
+  "cleaning_actions": [
+    {"action": "clip_outliers", "column": "Age", "reason": "IQR outliers detected"}
+  ],
+  "feature_actions": [
+    {"action": "encode_onehot", "column": "City", "reason": "categorical column needs encoding"}
+  ],
   "model_plan": {
-    "models_to_try": [...],
+    "models_to_try": ["RandomForest", "GradientBoosting"],
     "use_optuna": true,
     "trials": 30,
     "cv_folds": 5,
-    "primary_metric": "f1|accuracy|roc_auc|r2|rmse",
+    "primary_metric": "f1",
     "reason": "..."
   },
-  "data_warnings": [...],
+  "data_warnings": [],
   "reasoning_summary": "..."
 }
 """
@@ -355,6 +372,131 @@ def _format_columns_detail(summary: DatasetSummary) -> str:
 
 
 # ─────────────────────────────────────────────
+# SANITISEUR — corrige les erreurs courantes du LLM
+# ─────────────────────────────────────────────
+
+# Actions qui appartiennent à cleaning_actions, pas feature_actions
+_CLEANING_ONLY_ACTIONS = {
+    "remove_outliers_iqr", "remove_outliers_zscore", "clip_outliers",
+    "impute_mean", "impute_median", "impute_mode", "impute_knn",
+    "drop_rows_nulls", "drop_duplicates", "fill_constant",
+}
+
+# Mots-clés dans les noms de colonnes qui indiquent une confusion LLM
+# (LLM utilise drop_column avec un faux nom de colonne pour supprimer des doublons)
+_DUPLICATE_KEYWORDS = {"duplicate", "doublons", "duplicates", "duplicate rows", "doublon"}
+
+# Actions feature qui nécessitent un champ "column"
+_FEATURE_NEEDS_COLUMN = {
+    "encode_onehot", "encode_ordinal", "encode_target",
+    "log_transform", "sqrt_transform", "binarize",
+}
+
+
+def _sanitize_llm_plan(raw: dict) -> dict:
+    """
+    Corrige automatiquement les erreurs courantes du LLM avant validation Pydantic :
+    - Déplace les cleaning actions mal placées dans feature_actions → cleaning_actions
+    - Supprime les feature_actions sans le champ obligatoire "column"
+    - Supprime les encode_onehot sans colonne spécifique
+    - Remplace drop_column("Duplicate rows") → drop_duplicates
+    """
+    cleaning = raw.get("cleaning_actions", [])
+    features = raw.get("feature_actions", [])
+
+    # ── Correction : drop_column avec faux nom "Duplicate rows" → drop_duplicates ──
+    cleaned_cleaning = []
+    for action in cleaning:
+        act_type = action.get("action", "")
+        col = (action.get("column") or "").lower()
+        if act_type == "drop_column" and any(kw in col for kw in _DUPLICATE_KEYWORDS):
+            cleaned_cleaning.append({
+                "action": "drop_duplicates",
+                "reason": action.get("reason", "Remove duplicate rows"),
+            })
+            logger.warning(
+                f"[Sanitize] drop_column('{action.get('column')}') → drop_duplicates "
+                f"(LLM a utilisé un faux nom de colonne pour supprimer les doublons)"
+            )
+        else:
+            cleaned_cleaning.append(action)
+    cleaning = cleaned_cleaning
+
+    valid_features = []
+    rescued = []
+
+    for action in features:
+        act_type = action.get("action", "")
+
+        # Cas 1 : action de cleaning mal placée dans feature_actions
+        if act_type in _CLEANING_ONLY_ACTIONS:
+            rescued.append(action)
+            logger.warning(f"[Sanitize] '{act_type}' déplacé de feature_actions → cleaning_actions")
+
+        # Cas 2 : action feature nécessitant un champ "column" absent
+        elif act_type in _FEATURE_NEEDS_COLUMN and "column" not in action:
+            logger.warning(f"[Sanitize] '{act_type}' supprimé — champ 'column' manquant")
+
+        # Cas 3 : standardize_numeric sans "columns"
+        elif act_type == "standardize_numeric" and "columns" not in action:
+            logger.warning(f"[Sanitize] 'standardize_numeric' supprimé — champ 'columns' manquant")
+
+        else:
+            valid_features.append(action)
+
+    # Fusionner les actions rescapées dans cleaning_actions (sans doublons)
+    existing_cleaning_keys = {(a.get("action"), a.get("column")) for a in cleaning}
+    for a in rescued:
+        key = (a.get("action"), a.get("column"))
+        if key not in existing_cleaning_keys:
+            cleaning.append(a)
+
+    raw["cleaning_actions"] = cleaning
+    raw["feature_actions"] = valid_features
+
+    if rescued:
+        logger.info(f"[Sanitize] {len(rescued)} action(s) déplacée(s) vers cleaning_actions")
+
+    return raw
+
+
+def _force_outlier_cleaning(raw: dict, summary: DatasetSummary) -> dict:
+    """
+    Si le LLM a oublié de nettoyer des colonnes avec outliers détectés,
+    on les ajoute automatiquement dans cleaning_actions.
+    """
+    cleaning = raw.get("cleaning_actions", [])
+
+    # Colonnes déjà traitées pour les outliers
+    already_handled = {
+        a.get("column")
+        for a in cleaning
+        if a.get("action") in {"clip_outliers", "remove_outliers_iqr", "remove_outliers_zscore"}
+    }
+
+    added = []
+    for col in summary.columns:
+        if (
+            col.has_outliers_iqr
+            and col.name != summary.target_column
+            and col.name not in already_handled
+            and col.is_numeric
+        ):
+            cleaning.append({
+                "action": "clip_outliers",
+                "column": col.name,
+                "reason": f"Outliers IQR détectés — ajouté automatiquement (LLM oublié)",
+            })
+            added.append(col.name)
+
+    if added:
+        logger.warning(f"[ForceOutlier] clip_outliers ajouté automatiquement pour : {added}")
+
+    raw["cleaning_actions"] = cleaning
+    return raw
+
+
+# ─────────────────────────────────────────────
 # CORE: GENERATE DECISION PLAN
 # ─────────────────────────────────────────────
 
@@ -398,6 +540,12 @@ def generate_decision_plan(
 
     # Injection du run_id si absent
     raw_json.setdefault("run_id", summary.run_id)
+
+    # ── Sanitiseur : corriger les erreurs courantes du LLM ────────────────────
+    raw_json = _sanitize_llm_plan(raw_json)
+
+    # ── Forcer clip_outliers pour les colonnes avec outliers détectés ─────────
+    raw_json = _force_outlier_cleaning(raw_json, summary)
 
     # Ajout metadata
     import os
